@@ -69,12 +69,12 @@ class Projection(object):
             [0,  np.cos(-theta_rad), -np.sin(-theta_rad)],
             [0,  np.sin(-theta_rad),  np.cos(-theta_rad)]
         ])
-        t_bev_world = np.array([0, 2.5, 0])
-        t_bev_world_inv = np.array([0, -2.5, 0])
+        t_bev_world = np.array([0, -2.5, 0]) # in opencv type
+        t_bev_world_inv = np.array([0, 2.5, 0])
 
         # Front camera: position (0, 1, 0), orientation (0, 0, 0)
         R_front = np.eye(3)
-        t_front_world = np.array([0, 1.0, 0])
+        t_front_world = np.array([0, -1.0, 0]) # in opencv type
 
         # =============================================
         # STEP 3-6: Project each BEV pixel to front pixel
@@ -116,6 +116,7 @@ class Projection(object):
             # Convert OpenGL -> OpenCV, then apply K
             
             projected = K @ point_front
+            print("point front: \n",point_front)
             print("projection: \n",projected)
             u_front = projected[0] / projected[2]
             v_front = projected[1] / projected[2]
