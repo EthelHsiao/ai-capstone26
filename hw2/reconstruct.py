@@ -4,6 +4,7 @@ import argparse
 import os
 import copy
 import cv2
+import time
 from scipy.spatial.transform import Rotation
 from scipy.spatial import KDTree
 
@@ -129,7 +130,9 @@ def execute_global_registration(source_down, target_down,
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold),
         ],
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4_000_000, 500),
+        # 4,000,000 iterations is extremely slow on laptops; this keeps alignment
+        # quality reasonable while making runtime practical for homework-scale runs.
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(80_000, 200),
     )
     return result
 
@@ -336,8 +339,8 @@ def reconstruct(args):
         pred_cam_pos : (N, 3) estimated camera positions in the same frame
     """
     data_root  = args.data_root
-    voxel_size = 0.02          # 2 cm – good balance of speed and accuracy
-    icp_thresh = voxel_size * 0.4
+    voxel_size = 0.05          # 2 cm – good balance of speed and accuracy
+    icp_thresh = voxel_size * 0.5
 
     depth_dir = os.path.join(data_root, 'depth')
     rgb_dir   = os.path.join(data_root, 'rgb')
@@ -368,7 +371,8 @@ def reconstruct(args):
     # ── frame 0 ───────────────────────────────────────────────────────────────
     rgb0, depth0 = load_frame(1)
     pcd_prev = depth_image_to_point_cloud(rgb0, depth0)
-    result_pcd  += copy.deepcopy(pcd_prev)        # add frame 0 (already at origin)
+    prev_down, prev_fpfh = preprocess_point_cloud(pcd_prev, voxel_size)
+    result_pcd += copy.deepcopy(pcd_prev)         # add frame 0 (already at origin)
 
     # ── frames 1 … N-1 ────────────────────────────────────────────────────────
     for i in range(1, n_frames):
@@ -379,7 +383,7 @@ def reconstruct(args):
 
         # ─ voxel downsample + FPFH ────────────────────────────────────────────
         src_down, src_fpfh = preprocess_point_cloud(pcd_curr, voxel_size)
-        tgt_down, tgt_fpfh = preprocess_point_cloud(pcd_prev, voxel_size)
+        tgt_down, tgt_fpfh = prev_down, prev_fpfh
 
         # ─ global registration (RANSAC) ────────────────────────────────────────
         ransac = execute_global_registration(src_down, tgt_down,
@@ -409,6 +413,7 @@ def reconstruct(args):
         result_pcd += pcd_curr_global
 
         pcd_prev = pcd_curr   # advance (kept in camera frame for next ICP)
+        prev_down, prev_fpfh = src_down, src_fpfh
 
     print()
 
@@ -417,6 +422,14 @@ def reconstruct(args):
 
     pred_cam_pos = np.array(pred_cam_pos)   # (N, 3)
     return result_pcd, pred_cam_pos
+
+
+def run_with_timing(func, *args, **kwargs):
+    """Run a function and return (result, elapsed_seconds)."""
+    t0 = time.perf_counter()
+    result = func(*args, **kwargs)
+    elapsed = time.perf_counter() - t0
+    return result, elapsed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,8 +450,9 @@ if __name__ == '__main__':
     elif args.floor == 2:
         args.data_root = 'data_collection/second_floor/'
 
-    # ── run reconstruction ────────────────────────────────────────────────────
-    result_pcd, pred_cam_pos = reconstruct(args)
+    # ── run reconstruction with timing ───────────────────────────────────────
+    (result_pcd, pred_cam_pos), elapsed_sec = run_with_timing(reconstruct, args)
+    print(f"Reconstruction runtime: {elapsed_sec:.2f} s ({elapsed_sec / 60.0:.2f} min)")
 
     # ── load GT and convert to ICP frame ─────────────────────────────────────
     gt_poses = np.load(os.path.join(args.data_root, 'GT_pose.npy'))
@@ -455,7 +469,7 @@ if __name__ == '__main__':
     # In the camera's OpenCV frame: Y is DOWN → ceiling is at NEGATIVE Y.
     # Points more than `ceil_above` metres above the camera are discarded.
     # Tune this value if the ceiling is not fully removed.
-    ceil_above = 1.0          # metres above camera level → Y < -ceil_above
+    ceil_above = 0.8        # metres above camera level → Y < -ceil_above
     pts  = np.asarray(result_pcd.points)
     cols = np.asarray(result_pcd.colors)
     mask = pts[:, 1] > -ceil_above
