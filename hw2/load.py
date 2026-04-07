@@ -114,7 +114,9 @@ def navigateAndSee(action="", data_root='data_collection/second_floor/'):
     
     count += 1
     cv2.imwrite(data_root + f"rgb/{count}.png", transform_rgb_bgr(observations["color_sensor"]))
-    cv2.imwrite(data_root + f"depth/{count}.png", transform_depth(observations["depth_sensor"]))
+    # Save depth as uint16 PNG in millimetres (depth_scale = 1000 → divide by 1000 to get metres)
+    depth_mm = (observations["depth_sensor"] * 1000).astype(np.uint16)
+    cv2.imwrite(data_root + f"depth/{count}.png", depth_mm)
     cv2.imwrite(data_root + f"semantic/{count}.png", transform_semantic(observations["semantic_sensor"]))
     
     cam_extr.append([sensor_state.position[0], sensor_state.position[1], sensor_state.position[2], 
