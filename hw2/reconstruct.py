@@ -231,9 +231,10 @@ def my_local_icp_algorithm(source_down, target_down, trans_init, voxel_size):
     Returns:
         Object with attribute .transformation  (4×4 accumulated transform)
     """
-    threshold  = voxel_size * 1.5
-    max_iters  = 50
-    tol        = 1e-6
+    # TEST:Params
+    threshold  = voxel_size * 2
+    max_iters  = 20
+    tol        = 1e-4
 
     src_pts = np.asarray(source_down.points, dtype=np.float64)   # (N, 3)
     tgt_pts = np.asarray(target_down.points, dtype=np.float64)   # (M, 3)
@@ -250,7 +251,7 @@ def my_local_icp_algorithm(source_down, target_down, trans_init, voxel_size):
 
     for _ in range(max_iters):
         # Step 1 – vectorised nearest-neighbour search
-        dist, idx = kd_tree.query(src_t)       # dist: (N,), idx: (N,)
+        dist, idx = kd_tree.query(src_t, workers=-1)  # TEST:用所有 CPU 核心     # dist: (N,), idx: (N,)
         valid = dist < threshold
         if valid.sum() < 6:
             break                               # too few correspondences
@@ -339,7 +340,7 @@ def reconstruct(args):
         pred_cam_pos : (N, 3) estimated camera positions in the same frame
     """
     data_root  = args.data_root
-    voxel_size = 0.05          # 2 cm – good balance of speed and accuracy
+    voxel_size = 0.08          # 5 cm – good balance of speed and accuracy
     icp_thresh = voxel_size * 0.5
 
     depth_dir = os.path.join(data_root, 'depth')
@@ -418,8 +419,8 @@ def reconstruct(args):
     print()
 
     # ── final downsample (memory & display efficiency) ────────────────────────
-    result_pcd = result_pcd.voxel_down_sample(voxel_size * 2)
-
+    result_pcd = result_pcd.voxel_down_sample(voxel_size * 2) # TEST: draw 
+    # result_pcd = result_pcd.voxel_down_sample(0.02) 
     pred_cam_pos = np.array(pred_cam_pos)   # (N, 3)
     return result_pcd, pred_cam_pos
 
@@ -469,7 +470,7 @@ if __name__ == '__main__':
     # In the camera's OpenCV frame: Y is DOWN → ceiling is at NEGATIVE Y.
     # Points more than `ceil_above` metres above the camera are discarded.
     # Tune this value if the ceiling is not fully removed.
-    ceil_above = 0.8        # metres above camera level → Y < -ceil_above
+    ceil_above = 0.6      # metres above camera level → Y < -ceil_above
     pts  = np.asarray(result_pcd.points)
     cols = np.asarray(result_pcd.colors)
     mask = pts[:, 1] > -ceil_above
