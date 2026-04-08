@@ -2,7 +2,6 @@ import numpy as np
 from PIL import Image
 import numpy as np
 import habitat_sim
-import magnum as mn
 from habitat_sim.utils.common import d3_40_colors_rgb
 import cv2
 import os
@@ -62,11 +61,11 @@ def make_simple_cfg(settings):
     rgb_sensor_spec.sensor_type = habitat_sim.SensorType.COLOR
     rgb_sensor_spec.resolution = [settings["height"], settings["width"]]
     rgb_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
-    rgb_sensor_spec.orientation = mn.Vector3(
+    rgb_sensor_spec.orientation = np.array([
         float(settings["sensor_pitch"]),
         0.0,
         0.0,
-    )
+    ], dtype=np.float32)
     rgb_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     #depth snesor
@@ -75,11 +74,7 @@ def make_simple_cfg(settings):
     depth_sensor_spec.sensor_type = habitat_sim.SensorType.DEPTH
     depth_sensor_spec.resolution = [settings["height"], settings["width"]]
     depth_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
-    depth_sensor_spec.orientation = mn.Vector3(
-        float(settings["sensor_pitch"]),
-        0.0,
-        0.0,
-    )
+    depth_sensor_spec.orientation = np.array([float(settings["sensor_pitch"]), 0.0, 0.0], dtype=np.float32)
     depth_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     #semantic snesor
@@ -88,11 +83,7 @@ def make_simple_cfg(settings):
     semantic_sensor_spec.sensor_type = habitat_sim.SensorType.SEMANTIC
     semantic_sensor_spec.resolution = [settings["height"], settings["width"]]
     semantic_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
-    semantic_sensor_spec.orientation = mn.Vector3(
-        float(settings["sensor_pitch"]),
-        0.0,
-        0.0,
-    )
+    semantic_sensor_spec.orientation = np.array([float(settings["sensor_pitch"]), 0.0, 0.0], dtype=np.float32)
     semantic_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     agent_cfg.sensor_specifications = [rgb_sensor_spec, depth_sensor_spec, semantic_sensor_spec]
@@ -115,8 +106,7 @@ def navigateAndSee(action="", data_root='data_collection/second_floor/'):
     
     count += 1
     cv2.imwrite(data_root + f"rgb/{count}.png", transform_rgb_bgr(observations["color_sensor"]))
-    # Save depth as uint16 PNG in millimetres (depth_scale = 1000 → divide by 1000 to get metres)
-    depth_mm = (observations["depth_sensor"] * 1000).astype(np.uint16)
+    depth_mm = (observations["depth_sensor"] * 1000).astype(np.uint16) # TEST: Convert depth to millimeters and uint16
     cv2.imwrite(data_root + f"depth/{count}.png", depth_mm)
     cv2.imwrite(data_root + f"semantic/{count}.png", transform_semantic(observations["semantic_sensor"]))
     
