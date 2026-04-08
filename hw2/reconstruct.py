@@ -132,7 +132,8 @@ def execute_global_registration(source_down, target_down,
         ],
         # 4,000,000 iterations is extremely slow on laptops; this keeps alignment
         # quality reasonable while making runtime practical for homework-scale runs.
-        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(80_000, 200),
+        # TEST
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(40_000, 200),
     )
     return result
 
@@ -340,8 +341,8 @@ def reconstruct(args):
         pred_cam_pos : (N, 3) estimated camera positions in the same frame
     """
     data_root  = args.data_root
-    voxel_size = 0.08          # 5 cm – good balance of speed and accuracy
-    icp_thresh = voxel_size * 0.5
+    voxel_size = 0.05          # 5 cm – good balance of speed and accuracy
+    icp_thresh = voxel_size * 1.5
 
     depth_dir = os.path.join(data_root, 'depth')
     rgb_dir   = os.path.join(data_root, 'rgb')
@@ -387,9 +388,16 @@ def reconstruct(args):
         tgt_down, tgt_fpfh = prev_down, prev_fpfh
 
         # ─ global registration (RANSAC) ────────────────────────────────────────
+        # TEST
+        # 每兩幀跑一次 RANSAC，下一幀重用同一個結果
+        # if i % 2 == 1:  # 奇數幀跑 RANSAC
+        #     ransac = execute_global_registration(src_down, tgt_down,
+        #                                  src_fpfh, tgt_fpfh,
+        #                                  voxel_size)
+        # trans_init = ransac.transformation  # 奇數偶數幀都用同一個
         ransac = execute_global_registration(src_down, tgt_down,
-                                             src_fpfh, tgt_fpfh,
-                                             voxel_size)
+                                     src_fpfh, tgt_fpfh,
+                                     voxel_size)
 
         # ─ local registration (ICP) ────────────────────────────────────────────
         if args.version == 'open3d':
