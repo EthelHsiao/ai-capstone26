@@ -116,7 +116,7 @@ def local_icp_algorithm(source_down, target_down, trans_init, threshold):
         source_down, target_down,
         threshold, trans_init,
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=200),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
     )
     return result
 
