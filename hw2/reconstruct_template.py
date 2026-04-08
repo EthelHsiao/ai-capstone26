@@ -402,7 +402,7 @@ def reconstruct(args):
     rgb0, depth0 = load_frame(1)
     pcd_prev = depth_image_to_point_cloud(rgb0, depth0)
     prev_down, prev_fpfh = preprocess_point_cloud(pcd_prev, voxel_size)
-    accumulated_pcd += deepcopy(pcd_prev)
+    accumulated_pcd += deepcopy(prev_down)
 
     # Reconstruction Loop [cite: 29-30]
     for i in range(1, n_frames):
@@ -436,9 +436,9 @@ def reconstruct(args):
         camera_poses.append(T_cum)
         predicted_cam_poses.append(T_cum[:3, 3].copy())
 
-        pcd_curr_global = deepcopy(pcd_curr)
-        pcd_curr_global.transform(T_cum)
-        accumulated_pcd += pcd_curr_global
+        src_down_global = deepcopy(src_down)
+        src_down_global.transform(T_cum)
+        accumulated_pcd += src_down_global
 
         prev_down, prev_fpfh = src_down, src_fpfh
 

@@ -389,7 +389,7 @@ def reconstruct(args):
     rgb0, depth0 = load_frame(1)
     pcd_prev = depth_image_to_point_cloud(rgb0, depth0)
     prev_down, prev_fpfh = preprocess_point_cloud(pcd_prev, voxel_size)
-    result_pcd += copy.deepcopy(pcd_prev)
+    result_pcd += copy.deepcopy(prev_down)
 
     for i in range(1, n_frames):
         print(f"\r  frame {i}/{n_frames-1}", end='', flush=True)
@@ -416,9 +416,9 @@ def reconstruct(args):
         T_cum = T_cum @ T_icp
         pred_cam_pos.append(T_cum[:3, 3].copy())
 
-        pcd_curr_global = copy.deepcopy(pcd_curr)
-        pcd_curr_global.transform(T_cum)
-        result_pcd += pcd_curr_global
+        src_down_global = copy.deepcopy(src_down)
+        src_down_global.transform(T_cum)
+        result_pcd += src_down_global
 
         pcd_prev = pcd_curr
         prev_down, prev_fpfh = src_down, src_fpfh
