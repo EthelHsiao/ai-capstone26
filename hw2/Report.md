@@ -631,9 +631,8 @@ The following experiments were conducted on Floor 1.
 
 | voxel_size | icp_version | Mean L2 (m) | Time (s) |
 |---|---|---|---|
-| 0.03 | my_icp | `[TODO]` | `[TODO]` |
+| 0.03 | my_icp | 0.0474 | 743.46 |
 | 0.05 | my_icp | `[TODO]` | `[TODO]` |
-| 0.07 | my_icp | `[TODO]` | `[TODO]` |
 
 `voxel_size` controls the trade-off between runtime and geometric fidelity. A larger voxel size produces fewer points after downsampling, which speeds up normal estimation, FPFH computation, RANSAC, and ICP. However, if the voxel size is too large, fine geometric structure is removed and the alignment accuracy may degrade. In this project, `voxel_size = 0.05` provides a good balance between speed and reconstruction quality.
 
@@ -645,17 +644,9 @@ The following experiments were conducted on Floor 1.
 
 | icp_threshold | icp_version | Mean L2 (m) | Time (s) |
 |---|---|---|---|
-| voxel_size * 1.5 | `open3d` | `[TODO]` | `[TODO]` |
-| voxel_size * 2 | `my_icp` | `[TODO]` | `[TODO]` |
+| voxel_size * 1.5 | `open3D` | 0.0359 | 337.0 |
+| voxel_size * 2 | `open3D` | 0.0371 | 338.8 |
 
-**Floor 2**
-
-The following experiments were conducted on Floor 2.
-
-| icp_threshold | icp_version | Mean L2 (m) | Time (s) |
-|---|---|---|---|
-| voxel_size * 1.5 | `open3d` | `[TODO]` | `[TODO]` |
-| voxel_size * 2 | `my_icp` | `[TODO]` | `[TODO]` |
 
 `icp_threshold` determines the maximum distance for accepting point correspondences during Open3D ICP. A smaller threshold is stricter and can reject more outliers, but it may also fail when the initial alignment is not close enough. A larger threshold makes ICP more tolerant but can introduce incorrect matches. Setting it to `voxel_size * 1.5` keeps the threshold proportional to the point cloud resolution.
 
@@ -667,8 +658,8 @@ The following experiments were conducted on Floor 1.
 
 | FPFH max_nn | icp_version | Mean L2 (m) | Time (s) |
 |---|---|---|---|
-| 50 | `my_icp` | `[TODO]` | `[TODO]` |
-| 100 | `my_icp` | `[TODO]` | `[TODO]` |
+| 50 | `my_icp` | 0.0367 | 246.6 |
+| 100 | `my_icp` | 0.0365 | 447.82 |
 
 **Floor 2**
 
