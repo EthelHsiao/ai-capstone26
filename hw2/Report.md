@@ -462,6 +462,7 @@ Converts a quaternion `(qw, qx, qy, qz)` to a 3x3 rotation matrix. Note that `sc
 ### 2.1 Floor 1 Reconstruction
 
 <!-- [TODO: Run the following 3 commands and record the results] -->
+![alt text](image.png)
 
 ```bash
 python reconstruct.py -f 1 -v open3d
@@ -502,6 +503,16 @@ python reconstruct.py -f 2 -v my_icp --icp_method point_to_point
 ---
 
 ### 2.3 Comparison Table
+
+| voxel_size | icp_threshold | FPFH max_nn | max_iters | tolerance of early stopping |
+|---|---|---|---|---|
+| 0.05 | 0.075 (`voxel_size * 1.5`) | 70 | 20 | 1e-4 |
+
+- `voxel_size`: The side length of each voxel used in downsampling. A larger value reduces the number of points more aggressively, improving speed but potentially removing geometric detail.
+- `icp_threshold`: The maximum correspondence distance accepted by Open3D ICP. Point pairs farther than this threshold are rejected during local refinement.
+- `FPFH max_nn`: The maximum number of neighbors used when computing the FPFH descriptor for each point. This controls the amount of local geometric information used for RANSAC feature matching.
+- `max_iters`: The maximum number of ICP iterations allowed before stopping. It limits runtime and prevents unnecessary refinement steps.
+- `tolerance of early stopping`: The convergence threshold used in custom ICP. If the RMS residual improvement between two iterations is smaller than this value, the algorithm stops early.
 
 The following table summarizes the hyperparameters and results across all experiments.
 
@@ -547,9 +558,67 @@ The following table summarizes the hyperparameters and results across all experi
 
 <!-- [TODO: Fill in after running experiments, referencing the results above] -->
 
+| icp_method | Mean L2 (m) | Time (s) |
+|---|---|---|
+| point-to-point | `[TODO]` | `[TODO]` |
+| Point-to-Plane | `[TODO]` | `[TODO]` |
+
 Point-to-Plane ICP consistently achieves lower L2 error than Point-to-Point ICP. This is because Point-to-Plane allows source points to slide along the target surface during optimization, which better handles planar regions (walls, floors) that are common in indoor environments. Point-to-Point ICP treats every direction equally, causing it to converge more slowly and sometimes to a worse local minimum.
 
-#### Impact of FPFH max_nn
+#### voxel_size
+
+The following experiments were conducted on Floor 1.
+
+| voxel_size | icp_version | Mean L2 (m) | Time (s) |
+|---|---|---|---|
+| 0.03 | my_icp | `[TODO]` | `[TODO]` |
+| 0.05 | my_icp | `[TODO]` | `[TODO]` |
+| 0.07 | my_icp | `[TODO]` | `[TODO]` |
+
+`voxel_size` controls the trade-off between runtime and geometric fidelity. A larger voxel size produces fewer points after downsampling, which speeds up normal estimation, FPFH computation, RANSAC, and ICP. However, if the voxel size is too large, fine geometric structure is removed and the alignment accuracy may degrade. In this project, `voxel_size = 0.05` provides a good balance between speed and reconstruction quality.
+
+#### icp_threshold
+
+**Floor 1**
+
+The following experiments were conducted on Floor 1.
+
+| icp_threshold | icp_version | Mean L2 (m) | Time (s) |
+|---|---|---|---|
+| voxel_size * 1.5 | `open3d` | `[TODO]` | `[TODO]` |
+| voxel_size * 2 | `my_icp` | `[TODO]` | `[TODO]` |
+
+**Floor 2**
+
+The following experiments were conducted on Floor 2.
+
+| icp_threshold | icp_version | Mean L2 (m) | Time (s) |
+|---|---|---|---|
+| voxel_size * 1.5 | `open3d` | `[TODO]` | `[TODO]` |
+| voxel_size * 2 | `my_icp` | `[TODO]` | `[TODO]` |
+
+`icp_threshold` determines the maximum distance for accepting point correspondences during Open3D ICP. A smaller threshold is stricter and can reject more outliers, but it may also fail when the initial alignment is not close enough. A larger threshold makes ICP more tolerant but can introduce incorrect matches. Setting it to `voxel_size * 1.5` keeps the threshold proportional to the point cloud resolution.
+
+#### FPFH max_nn
+
+**Floor 1**
+
+The following experiments were conducted on Floor 1.
+
+| FPFH max_nn | icp_version | Mean L2 (m) | Time (s) |
+|---|---|---|---|
+| 50 | `my_icp` | `[TODO]` | `[TODO]` |
+| 100 | `my_icp` | `[TODO]` | `[TODO]` |
+
+**Floor 2**
+
+The following experiments were conducted on Floor 2.
+
+| FPFH max_nn | icp_version | Mean L2 (m) | Time (s) |
+|---|---|---|---|
+| 50 | `my_icp` | `[TODO]` | `[TODO]` |
+| 70 | `my_icp` | `[TODO]` | `[TODO]` |
+| 100 | `my_icp` | `[TODO]` | `[TODO]` |
 
 <!-- [TODO: If you want to include this experiment, run:] -->
 <!-- Change max_nn in preprocess_point_cloud to 50, 70, 100 and compare -->
@@ -558,9 +627,28 @@ From preliminary testing, the FPFH `max_nn` parameter affects the quality of RAN
 - Floor 1: `max_nn=50` was sufficient for good results.
 - Floor 2: A larger `max_nn` (70 or 100) was needed for comparable accuracy, likely because the second floor has more complex geometry.
 
-#### Impact of Data Collection
+#### max_iters (fix `tol = 1e-4`, test `10 / 20 / 50`)
 
-The quality of the data collection step significantly affects reconstruction results. Frames that are too far apart result in insufficient overlap for ICP, while too many frames in the same area waste computation. A smooth, consistent trajectory with adequate coverage leads to the best reconstruction.
+The following experiments were conducted on Floor 1.
+
+| max_iters | icp_version | Mean L2 (m) | Time (s) |
+|---|---|---|---|
+| 10 | my_icp | `[TODO]` | `[TODO]` |
+| 20 | my_icp | `[TODO]` | `[TODO]` |
+| 50 | my_icp | `[TODO]` | `[TODO]` |
+
+`max_iters` limits how many times ICP updates the transformation. Increasing this value may slightly improve alignment if the initialization is already good, but it also increases runtime. In practice, using `20` iterations was sufficient for both Open3D ICP and the custom ICP variants, because most frame-to-frame alignments converged well before hitting the maximum.
+
+#### tolerance of early stopping (fix `max_iters = 20`, test `1e-4 / 1e-6`)
+
+The following experiments were conducted on Floor 1.
+
+| tolerance of early stopping | icp_version | Mean L2 (m) | Time (s) |
+|---|---|---|---|
+| 1e-4 | my_icp | `[TODO]` | `[TODO]` |
+| 1e-6 | my_icp | `[TODO]` | `[TODO]` |
+
+The early stopping tolerance decides when the custom ICP algorithm is considered converged. If the improvement in RMS residual becomes smaller than the chosen value, the optimization stops instead of continuing to make negligible updates. This helps reduce unnecessary iterations and improves runtime without noticeably harming reconstruction quality.
 
 ---
 
