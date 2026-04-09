@@ -71,7 +71,7 @@ def preprocess_point_cloud(pcd, voxel_size):
     radius_feature = voxel_size * 5.0
     pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
         pcd_down,
-        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100)
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=70) #TEST
     )
     return pcd_down, pcd_fpfh
 
@@ -319,7 +319,10 @@ def visualize_and_evaluate(reconstructed_pcd, predicted_cam_poses, gt_poses, arg
     TASK 3: Evaluation & Visualization [cite: 19, 35-38]
     """
     # Convert GT poses to ICP frame positions
-    gt_raw = np.load(os.path.join(args.data_root, 'GT_pose.npy'))
+    gt_raw = np.array([
+        [T[0, 3], T[1, 3], T[2, 3], *R.from_matrix(T[:3, :3]).as_quat()[[3, 0, 1, 2]]]
+        for T in gt_poses
+    ])
     gt_pos = _gt_positions_in_icp_frame(gt_raw)
     n = len(predicted_cam_poses)
     gt_pos = gt_pos[:n]
@@ -456,7 +459,8 @@ if __name__ == '__main__':
     parser.add_argument('-f', '--floor', type=int, default=1)
     parser.add_argument('-v', '--version', type=str, default='open3d',
                         help='open3d or my_icp')
-    parser.add_argument('--icp_method', type=str, default='point_to_plane',
+    parser.add_argument('--icp_method', '--icp-method', dest='icp_method',
+                        type=str, default='point_to_plane',
                         choices=['point_to_point', 'point_to_plane'],
                         help='ICP method for custom ICP: point_to_point or point_to_plane')
     args = parser.parse_args()

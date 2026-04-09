@@ -446,7 +446,8 @@ if __name__ == '__main__':
     parser.add_argument('-f', '--floor',   type=int, default=1)
     parser.add_argument('-v', '--version', type=str, default='open3d',
                         help='open3d  or  my_icp')
-    parser.add_argument('--icp_method', type=str, default='point_to_plane',
+    parser.add_argument('--icp_method', '--icp-method', dest='icp_method',
+                        type=str, default='point_to_plane',
                         choices=['point_to_point', 'point_to_plane'],
                         help='ICP method for custom ICP: point_to_point or point_to_plane')
     parser.add_argument('--data_root', type=str,
