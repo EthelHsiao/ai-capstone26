@@ -175,11 +175,11 @@ For each point, the algorithm finds up to 30 neighbors within a radius of `2 * v
 radius_feature = voxel_size * 5.0
 pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
     pcd_down,
-    o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100)
+    o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=70)
 )
 ```
 
-FPFH (Fast Point Feature Histogram) encodes the local geometric structure around each point as a 33-dimensional descriptor. It captures angular relationships between normals of neighboring points. Two points with similar FPFH descriptors likely share similar local geometry, which allows RANSAC to find correspondences even when point clouds are far apart.
+FPFH (Fast Point Feature Histogram) encodes the local geometric structure around each point as a 33-dimensional descriptor. For each point, the algorithm looks at its neighbors (up to 70 within a radius of `5 * voxel_size = 0.25m`) and computes angular relationships between their normals. These angles are binned into a histogram that characterizes the local surface shape — for example, a point on a flat wall will have a very different FPFH descriptor than a point on a table corner. Two points with similar FPFH descriptors likely share similar local geometry, which allows RANSAC to find correspondences even when point clouds are far apart. The `max_nn=70` parameter balances descriptor quality against computation speed.
 
 ---
 
@@ -252,17 +252,29 @@ def my_local_icp_algorithm(source_pcd, target_pcd, initial_transform,
 
 #### 1.7.1 Custom Point-to-Point ICP
 
-**Nearest Neighbor Search:**
+Point-to-Point ICP minimizes the sum of squared Euclidean distances between corresponding points: `sum_i ||R * p_i + t - q_i||^2`. It repeats three steps — find correspondences, compute the best rigid transform, apply it — until convergence.
+
+**Step 1 — Initialization:**
+
+```python
+T_cum = trans_init.astype(np.float64).copy()
+src_h = np.hstack([src_pts, np.ones((len(src_pts), 1))])
+src_t = (T_cum @ src_h.T).T[:, :3]
+```
+
+The source points are converted to homogeneous coordinates `[x, y, z, 1]` so they can be multiplied by the 4x4 transformation matrix. The initial RANSAC transform `trans_init` is applied to bring the source points roughly close to the target. `T_cum` will accumulate all incremental transforms throughout the iterations.
+
+**Step 2 — Nearest Neighbor Search:**
 
 ```python
 kd_tree = KDTree(tgt_pts)
 dist, idx = kd_tree.query(src_t, workers=-1)
-valid = dist < threshold
+valid = dist < threshold   # threshold = voxel_size * 2 = 0.1
 ```
 
-A KD-Tree is built on the target points using `scipy.spatial.KDTree`. For each transformed source point, the closest target point is found. Correspondences with distance greater than `threshold = voxel_size * 2` are rejected as outliers. `workers=-1` uses all CPU cores for parallel querying.
+A KD-Tree is built on the target points once before the loop using `scipy.spatial.KDTree`. In each iteration, for every transformed source point, the tree finds the closest target point and returns both the distance and the index. `workers=-1` distributes queries across all CPU cores for speed. Correspondences with distance greater than `threshold = voxel_size * 2 = 0.1m` are rejected — these are likely incorrect matches caused by occlusion boundaries or parts of the scene visible in one frame but not the other.
 
-**Early Stopping:**
+**Step 3 — Early Stopping:**
 
 ```python
 rms = dist[valid].mean()
@@ -270,69 +282,106 @@ if abs(prev_rms - rms) < tol:
     break
 ```
 
-If the mean distance improvement between iterations is less than `tol = 1e-4`, the algorithm converges and stops early.
+The mean distance of all valid correspondences serves as a convergence metric. If the improvement from the previous iteration is less than `tol = 1e-4`, the algorithm has effectively converged and stops early. This avoids wasting time on iterations that make negligible progress.
 
-**SVD-based Rigid Transform Estimation (Arun et al., 1987):**
+**Step 4 — SVD-based Rigid Transform Estimation (Arun et al., 1987):**
 
 ```python
 src_c = src - src_mean    # center source
 tgt_c = tgt - tgt_mean    # center target
-H = src_c.T @ tgt_c       # cross-covariance matrix
+H = src_c.T @ tgt_c       # 3x3 cross-covariance matrix
 U, _, Vt = np.linalg.svd(H)
 R_mat = Vt.T @ U.T        # optimal rotation
 t_vec = tgt_mean - R_mat @ src_mean  # optimal translation
 ```
 
-This computes the optimal rigid transformation by:
-1. Centering both point sets by subtracting their means.
-2. Computing the 3x3 cross-covariance matrix `H`.
-3. Performing SVD on `H` to extract the rotation `R = V * U^T`.
-4. If `det(R) < 0`, the last row of `Vt` is negated to ensure a proper rotation (no reflection).
-5. Translation is derived from the means: `t = q_mean - R * p_mean`.
+Given the matched point pairs, we need to find the rotation `R` and translation `t` that best align them. The SVD method works as follows:
+1. **Center** both point sets by subtracting their respective means. This decouples the rotation and translation problems.
+2. **Cross-covariance matrix** `H = src_centered^T @ tgt_centered` encodes the correlation between the two point sets. Its SVD reveals the optimal rotation.
+3. **SVD decomposition** `H = U S V^T` gives the optimal rotation as `R = V^T^T @ U^T = V @ U^T`.
+4. **Reflection check**: If `det(R) < 0`, the result is a reflection (physically impossible for rigid motion). Negating the last row of `Vt` fixes this.
+5. **Translation** is computed from the centroids: `t = target_mean - R * source_mean`.
 
-**Pose Accumulation:**
+This SVD solution gives the **globally optimal** rigid transform for the given correspondences — unlike the linearized Point-to-Plane method, it works correctly regardless of how large the rotation is.
+
+**Step 5 — Accumulate and Apply:**
 
 ```python
 T_cum = T_step @ T_cum
 src_t = (T_step[:3, :3] @ src_t.T).T + T_step[:3, 3]
 ```
 
-Each iteration produces an incremental transform `T_step`. It is composed with the cumulative transform, and the source points are updated accordingly.
+Each iteration produces an incremental transform `T_step` that maps the current source positions closer to the target. It is left-multiplied onto `T_cum` to accumulate, and the source points are updated by applying the new rotation and translation. The loop then repeats with the updated positions.
 
 #### 1.7.2 Custom Point-to-Plane ICP
 
-**Linearized Formulation:**
+Point-to-Plane ICP is different from Point-to-Point in how it measures the "error" of each correspondence. Instead of minimizing the full 3D distance between matched points, it only minimizes the distance **projected onto the target surface normal**. This means source points are allowed to slide freely along the target surface, which is ideal for indoor scenes with large flat regions (walls, floors, ceilings) — the algorithm only cares about getting closer to the surface, not about matching a specific point on it. This leads to faster convergence and better final alignment than Point-to-Point.
 
-The cost function is:
+**Correspondence threshold:** `threshold = voxel_size * 1.5 = 0.075m`, matching the Open3D ICP threshold.
 
-```
-minimize  sum_i  ( (R * p_i + t - q_i) . n_i )^2
-```
-
-Using the small-angle approximation for rotation (`R ~ I + [alpha, beta, gamma]x`), this becomes a linear system with 6 unknowns `x = [alpha, beta, gamma, tx, ty, tz]`:
+**Step 1 — Normal Preparation:**
 
 ```python
-cross = np.cross(p, n)          # p_i x n_i
-A = np.hstack([cross, n])       # (K, 6) matrix
-b = np.sum((q - p) * n, axis=1) # (K,)   right-hand side
+if not target_down.has_normals():
+    target_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
+    )
+tgt_normals = np.asarray(target_down.normals, dtype=np.float64)
+```
+
+Point-to-Plane ICP requires surface normals on the **target** point cloud. If normals were not already computed during preprocessing, they are estimated here. Each normal indicates which direction the local surface is facing.
+
+**Step 2 — Convergence Check (Point-to-Plane Residual):**
+
+```python
+residuals = np.sum((p - q) * n, axis=1)   # (p_i - q_i) . n_i
+rms = np.sqrt(np.mean(residuals ** 2))
+if abs(prev_rms - rms) < tol:
+    break
+```
+
+Unlike Point-to-Point which uses Euclidean distance, the convergence metric here is the **point-to-plane residual**: the dot product of the displacement vector `(p - q)` with the surface normal `n`. This measures how far each source point is from the target's tangent plane. When the RMS of these residuals stops improving, the algorithm has converged.
+
+**Step 3 — Linearized Formulation:**
+
+The cost function to minimize is:
+
+```
+sum_i  ( (R * p_i + t - q_i) . n_i )^2
+```
+
+This is a nonlinear problem because the rotation matrix `R` depends on three angles. To make it solvable in closed form, we use the **small-angle approximation**: if the incremental rotation between iterations is small (which is true when starting from a good RANSAC alignment), we can approximate `R ≈ I + [α, β, γ]×`, where `[α, β, γ]×` is the skew-symmetric matrix of the rotation angles.
+
+Substituting this into the cost function and expanding, each correspondence contributes one linear equation:
+
+```
+(p_i × n_i) · [α, β, γ] + n_i · [tx, ty, tz] = (q_i - p_i) · n_i
+```
+
+This is derived from the scalar triple product identity: `(ω × p) · n = (p × n) · ω`. Stacking all correspondences gives us the linear system `A x = b`:
+
+```python
+cross = np.cross(p, n)          # p_i × n_i  →  rotation coefficients
+A = np.hstack([cross, n])       # (K, 6) matrix: [rotation | translation]
+b = np.sum((q - p) * n, axis=1) # (K,)   right-hand side: target residual
 ```
 
 For each correspondence `(p_i, q_i, n_i)`:
-- Row of A: `[p_i x n_i | n_i]` (1x6)
-- Element of b: `(q_i - p_i) . n_i` (scalar)
+- Row of A: `[p_i × n_i | n_i]` — the first 3 columns relate to rotation, the last 3 to translation
+- Element of b: `(q_i - p_i) · n_i` — how far the source point is from the target plane
 
-**Solving the Normal Equations:**
+**Step 4 — Solving the Normal Equations:**
 
 ```python
-AtA = A.T @ A    # (6, 6)
-Atb = A.T @ b    # (6,)
+AtA = A.T @ A    # (6, 6) normal equation matrix
+Atb = A.T @ b    # (6,)   right-hand side
 x = np.linalg.solve(AtA, Atb)
 alpha, beta, gamma, tx, ty, tz = x
 ```
 
-This solves the 6x6 normal equations `(A^T A) x = A^T b` for the 6 unknowns of the rigid body motion.
+The overdetermined system (K equations, 6 unknowns) is solved via the normal equations `(A^T A) x = A^T b`, which gives the least-squares solution. The result is the 6 parameters of the incremental rigid body motion: three rotation angles `(α, β, γ)` and three translation components `(tx, ty, tz)`.
 
-**Constructing the Incremental Transform:**
+**Step 5 — Constructing the Incremental Transform:**
 
 ```python
 R_inc = np.array([
@@ -341,10 +390,10 @@ R_inc = np.array([
     [-beta,   alpha,  1    ],
 ])
 U, _, Vt = np.linalg.svd(R_inc)
-R_inc = U @ Vt   # re-orthogonalize
+R_inc = U @ Vt   # project back to valid rotation matrix
 ```
 
-The small-angle rotation matrix is constructed from the solved angles. Since the small-angle approximation causes `R_inc` to drift from being a valid rotation matrix over iterations, SVD re-orthogonalization projects it back onto SO(3) (the set of valid rotation matrices).
+The 3x3 matrix above is `I + [α, β, γ]×`, the small-angle approximation of the rotation. However, this matrix is not exactly orthogonal (a valid rotation must satisfy `R^T R = I` and `det(R) = 1`). Left uncorrected, small orthogonality errors would accumulate over 20 iterations and eventually corrupt the transformation. The SVD re-orthogonalization `R = U @ V^T` projects it back onto SO(3) — the mathematical space of all valid rotation matrices — finding the closest proper rotation. If `det < 0` (indicating a reflection), the last row of `Vt` is negated to enforce a proper rotation.
 
 ---
 
@@ -462,19 +511,23 @@ Converts a quaternion `(qw, qx, qy, qz)` to a 3x3 rotation matrix. Note that `sc
 ### 2.1 Floor 1 Reconstruction
 
 <!-- [TODO: Run the following 3 commands and record the results] -->
-![alt text](image.png)
-
-```bash
+Open3D 
+![alt text](image-3.png)
+My ICP (Point-to-Plane)
+![point-to-plane](image-1.png)
+My ICP (Point-to-Point)
+![alt text](image-2.png)
+<!-- ```bash
 python reconstruct.py -f 1 -v open3d
 python reconstruct.py -f 1 -v my_icp --icp_method point_to_plane
 python reconstruct.py -f 1 -v my_icp --icp_method point_to_point
-```
+``` -->
 
 | ICP Version | Mean L2 (m) | Time (s) |
 |---|---|---|
-| Open3D (Point-to-Plane) | `[TODO]` | `[TODO]` |
-| My ICP (Point-to-Plane) | `[TODO]` | `[TODO]` |
-| My ICP (Point-to-Point) | `[TODO]` | `[TODO]` |
+| Open3D  | 0.03597 | 229.67 |
+| My ICP (Point-to-Plane) | 0.0438 | 240.6 |
+| My ICP (Point-to-Point) | 0.2951 | 248.14 |
 
 <!-- [TODO: Insert screenshot of Floor 1 reconstruction (Open3D version)] -->
 <!-- [TODO: Insert screenshot of Floor 1 reconstruction (My ICP Point-to-Plane version)] -->
@@ -484,7 +537,12 @@ python reconstruct.py -f 1 -v my_icp --icp_method point_to_point
 ### 2.2 Floor 2 Reconstruction
 
 <!-- [TODO: Run the following 3 commands and record the results] -->
-
+Open3D
+![alt text](image-4.png)
+My ICP (Point-to-Plane)
+![alt text](image-8.png)
+My ICP (Point-to-Point)
+![alt text](image-9.png)
 ```bash
 python reconstruct.py -f 2 -v open3d
 python reconstruct.py -f 2 -v my_icp --icp_method point_to_plane
@@ -493,9 +551,9 @@ python reconstruct.py -f 2 -v my_icp --icp_method point_to_point
 
 | ICP Version | Mean L2 (m) | Time (s) |
 |---|---|---|
-| Open3D (Point-to-Plane) | `[TODO]` | `[TODO]` |
-| My ICP (Point-to-Plane) | `[TODO]` | `[TODO]` |
-| My ICP (Point-to-Point) | `[TODO]` | `[TODO]` |
+| Open3D | 0.0275 | 163.68 |
+| My ICP (Point-to-Plane) | 0.0359 | 143.92 |
+| My ICP (Point-to-Point) | 0.5944 | 144.22 |
 
 <!-- [TODO: Insert screenshot of Floor 2 reconstruction (Open3D version)] -->
 <!-- [TODO: Insert screenshot of Floor 2 reconstruction (My ICP Point-to-Plane version)] -->
@@ -538,6 +596,7 @@ The following table summarizes the hyperparameters and results across all experi
 | 1 | `[TODO]` | `[TODO]` | `[TODO]` |
 | 2 | `[TODO]` | `[TODO]` | `[TODO]` |
 
+
 #### Techniques Used in Custom ICP
 
 1. **SVD Re-orthogonalization (Point-to-Plane):** The small-angle approximation produces a matrix that is only approximately orthogonal. After each iteration, SVD is applied to project it back onto SO(3), preventing numerical drift over multiple iterations.
@@ -557,10 +616,11 @@ The following table summarizes the hyperparameters and results across all experi
 #### Point-to-Plane vs. Point-to-Point
 
 <!-- [TODO: Fill in after running experiments, referencing the results above] -->
-
+point-to-point
+![alt text](image-7.png)
 | icp_method | Mean L2 (m) | Time (s) |
 |---|---|---|
-| point-to-point | `[TODO]` | `[TODO]` |
+| point-to-point | 0.3176 | 253.64 |
 | Point-to-Plane | `[TODO]` | `[TODO]` |
 
 Point-to-Plane ICP consistently achieves lower L2 error than Point-to-Point ICP. This is because Point-to-Plane allows source points to slide along the target surface during optimization, which better handles planar regions (walls, floors) that are common in indoor environments. Point-to-Point ICP treats every direction equally, causing it to converge more slowly and sometimes to a worse local minimum.

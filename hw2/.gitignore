@@ -1,2 +1,9 @@
 data_collection
 .codex
+__pycache__/
+*.pyc
+ScreenCapture_*.png
+ScreenCamera_*.json
+RenderOption_*.json
+DepthCamera_*.json
+DepthCapture_*.png

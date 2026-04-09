@@ -197,7 +197,7 @@ def _my_icp_point_to_plane(source_down, target_down, trans_init, voxel_size):
 
     Requires normals on the *target* point cloud.
     """
-    threshold  = voxel_size * 2
+    threshold  = voxel_size * 1.5
     max_iters  = 20
     tol        = 1e-4
 
@@ -369,7 +369,7 @@ def visualize_and_evaluate(reconstructed_pcd, predicted_cam_poses, gt_poses, arg
 
 
 def reconstruct(args):
-    voxel_size = 0.05
+    voxel_size = 0.03 #TEST
     icp_thresh = voxel_size * 1.5
     rgb_dir = os.path.join(args.data_root, "rgb")
     depth_dir = os.path.join(args.data_root, "depth")
