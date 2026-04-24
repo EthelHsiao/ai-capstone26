@@ -1,4 +1,6 @@
 import math
+import os
+from contextlib import contextmanager
 from typing import List, Tuple
 
 import cv2
@@ -12,9 +14,10 @@ SENSOR_HEIGHT = 1.5
 SENSOR_WIDTH = 512
 SENSOR_HEIGHT_PX = 512
 SENSOR_PITCH = 0.0
-MOVE_AMOUNT = 0.1
+MOVE_AMOUNT = 0.05
 TURN_AMOUNT = 1.0
 INITIAL_HEADING = math.pi
+SUPPRESS_HABITAT_INIT_LOGS = True
 
 # Default action names
 MOVE_FORWARD = "move_forward"
@@ -43,6 +46,28 @@ def _transform_semantic(semantic_obs: np.ndarray) -> np.ndarray:
 # =============================
 # Simulator Core
 # =============================
+@contextmanager
+def _suppress_native_output(enabled: bool = True):
+    """Temporarily silence C/C++ stdout/stderr noise during simulator setup."""
+    if not enabled:
+        yield
+        return
+
+    stdout_fd = os.dup(1)
+    stderr_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(stdout_fd, 1)
+        os.dup2(stderr_fd, 2)
+        os.close(stdout_fd)
+        os.close(stderr_fd)
+        os.close(devnull_fd)
+
+
 def init_sim(scene_path: str = SCENE_PATH, start_x: float = 0.9, start_z: float = 4.6):
     """Initialize the Habitat simulator environment and set the agent's start state."""
     sim_settings = {
@@ -92,15 +117,16 @@ def init_sim(scene_path: str = SCENE_PATH, start_x: float = 0.9, start_z: float 
         ),
     }
 
-    # Initialize Simulator
-    cfg = habitat_sim.Configuration(sim_cfg, [agent_cfg])
-    sim = habitat_sim.Simulator(cfg)
+    with _suppress_native_output(SUPPRESS_HABITAT_INIT_LOGS):
+        # Initialize Simulator
+        cfg = habitat_sim.Configuration(sim_cfg, [agent_cfg])
+        sim = habitat_sim.Simulator(cfg)
 
-    # Initialize Agent at starting coordinates
-    agent = sim.initialize_agent(sim_settings["default_agent"])
-    agent_state = habitat_sim.AgentState()
-    agent_state.position = np.array([start_x, 0.0, start_z])  # World translation
-    agent.set_state(agent_state)
+        # Initialize Agent at starting coordinates
+        agent = sim.initialize_agent(sim_settings["default_agent"])
+        agent_state = habitat_sim.AgentState()
+        agent_state.position = np.array([start_x, 0.0, start_z])  # World translation
+        agent.set_state(agent_state)
 
     print("Habitat simulator initialized successfully.")
     return sim, agent, list(agent_cfg.action_space.keys())
@@ -118,14 +144,18 @@ def navigate_and_see(sim, agent, action: str, goal_index: int = None):
     rgb = _transform_rgb_bgr(obs["color_sensor"])
     depth = _transform_depth(obs["depth_sensor"])
     semantic_labels = obs["semantic_sensor"]
+    target_mask_pixels = 0
 
     # Overlay goal label if provided
     if goal_index is not None:
-        mask = semantic_labels == np.uint32(goal_index)
+        goal_indices = np.atleast_1d(goal_index).astype(np.uint32)
+        mask = np.isin(semantic_labels, goal_indices)
+        target_mask_pixels = int(np.count_nonzero(mask))
         if np.any(mask):
             overlay = rgb.copy()
             overlay[mask] = np.array([0, 0, 255], dtype=overlay.dtype)
             rgb = cv2.addWeighted(overlay, 0.3, rgb, 0.7, 0)
+    obs["target_mask_pixels"] = target_mask_pixels
 
     cv2.imshow("RGB", rgb)
     cv2.imshow("Depth", depth)
@@ -141,6 +171,26 @@ def execute_waypoint_path(path_world: List[Tuple[float, float]], sim, agent, goa
     (turning and moving forward).
     """
     heading = INITIAL_HEADING
+    frames = 0
+    seen_frames = 0
+    max_mask_pixels = 0
+    action_counts = {
+        MOVE_FORWARD: 0,
+        TURN_LEFT: 0,
+        TURN_RIGHT: 0,
+    }
+
+    def step_and_count(action: str):
+        nonlocal frames, seen_frames, max_mask_pixels
+        obs = navigate_and_see(sim, agent, action, goal_idx)
+        if obs is None:
+            return
+        action_counts[action] += 1
+        frames += 1
+        mask_pixels = int(obs.get("target_mask_pixels", 0))
+        if mask_pixels > 0:
+            seen_frames += 1
+            max_mask_pixels = max(max_mask_pixels, mask_pixels)
 
     for i in range(1, len(path_world)):
         x0, z0 = path_world[i - 1]
@@ -151,17 +201,32 @@ def execute_waypoint_path(path_world: List[Tuple[float, float]], sim, agent, goa
         dtheta = (target_angle - heading + math.pi) % (2 * math.pi) - math.pi
 
         # 1. Turn to align the agent towards the target angle
-        turn_steps = int(abs(math.degrees(dtheta)))
+        turn_steps = int(round(abs(math.degrees(dtheta)) / TURN_AMOUNT))
         action = TURN_LEFT if dtheta > 0 else TURN_RIGHT
         for _ in range(turn_steps):
-            navigate_and_see(sim, agent, action, goal_idx)
+            step_and_count(action)
 
         # 2. Step forward physically toward the waypoint
-        steps_forward = int(math.sqrt(dx**2 + dz**2) / MOVE_AMOUNT)
+        steps_forward = int(round(math.sqrt(dx**2 + dz**2) / MOVE_AMOUNT))
         for _ in range(steps_forward):
-            navigate_and_see(sim, agent, MOVE_FORWARD, goal_idx)
+            step_and_count(MOVE_FORWARD)
 
         # Update current heading tracker
         heading = target_angle
 
+    if goal_idx is not None and seen_frames == 0:
+        print("Target mask was not visible during motion; scanning in place...")
+        for _ in range(360):
+            step_and_count(TURN_LEFT)
+            if seen_frames > 0:
+                break
+
     print("Agent path execution completed.")
+    return {
+        "frames": frames,
+        "seen_frames": seen_frames,
+        "max_mask_pixels": max_mask_pixels,
+        "forward": action_counts[MOVE_FORWARD],
+        "left": action_counts[TURN_LEFT],
+        "right": action_counts[TURN_RIGHT],
+    }

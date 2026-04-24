@@ -27,13 +27,20 @@
 ```python
 # map_processor.py
 MAP_RESOLUTION = 10
-OBSTACLE_INFLATE_RADIUS = 3
+OBSTACLE_POINT_THRESHOLD = 3
+OBSTACLE_INFLATE_RADIUS = 0
+HEIGHT_FILTER_LOW = 0.05
+HEIGHT_FILTER_HIGH = 2.2
 
 # main.py (plan_path 參數)
 max_iter = 8000
 step_size = 15
 goal_bias = 0.15
 goal_tolerance = 15
+
+# navigator.py
+MOVE_AMOUNT = 0.05
+TURN_AMOUNT = 1.0
 ```
 
 **測試日期:** ___________
@@ -52,6 +59,17 @@ goal_tolerance = 15
 
 World path has _____ waypoints.
 Spawning Agent at world position: (_____.3f, _____.3f)
+
+Experiment summary:
+target                 : rack
+RRT result             : iterations=_____, nodes=_____, raw_waypoints=_____, smoothed_waypoints=_____
+smoothing reduction    : _____%
+smoothed path length   : _____ px / _____ m
+straight-line distance : _____ m
+occupancy              : free_regions=_____, obstacle_ratio=_____
+
+Navigation summary:
+frames=_____, target_seen_frames=_____, max_mask_pixels=_____
 ```
 
 **導航結果:** ☐ 成功  ☐ 失敗  ☐ 警告

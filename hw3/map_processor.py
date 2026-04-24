@@ -6,10 +6,14 @@ SCALE_FACTOR = 10000.0 / 255.0
 CEILING_COLOR = np.array([8, 255, 214])
 FLOOR_COLOR = np.array([255, 194, 7])
 
-# Resolution of the rasterized 2D map (pixels per world-meter).
-# Higher → finer map but larger image; 10 px/m is a good balance.
 MAP_RESOLUTION = 10  # pixels per world-meter
-OBSTACLE_INFLATE_RADIUS = 3  # pixels – how much to inflate obstacles
+OBSTACLE_POINT_THRESHOLD = 3  # Ignore very sparse projected points in occupancy.
+OBSTACLE_INFLATE_RADIUS = 0  # Keep doorways open; increase only if navigation clips walls.
+DISPLAY_SCALE = 3  # Enlarge OpenCV map windows without changing map coordinates.
+# Height above floor level to include as obstacles (metres).
+# Excludes floor clutter below 5 cm and anything above standing height.
+HEIGHT_FILTER_LOW = 0.05
+HEIGHT_FILTER_HIGH = 2.2
 
 
 def load_and_filter_map(point_path: str, color_path: str):
@@ -38,8 +42,12 @@ def load_and_filter_map(point_path: str, color_path: str):
     # ------------------------------------------------------------------
     ceil_mask = np.all(colors == CEILING_COLOR, axis=1)
     floor_mask = np.all(colors == FLOOR_COLOR, axis=1)
-    keep = ~(ceil_mask | floor_mask)
 
+    # Determine floor height from floor-coloured points so we can apply a
+    # height filter that keeps only obstacle-level geometry (walls, furniture).
+    floor_y_world = np.median((points[floor_mask] * SCALE_FACTOR)[:, 1])
+
+    keep = ~(ceil_mask | floor_mask)
     points = points[keep]
     colors = colors[keep]
 
@@ -50,63 +58,59 @@ def load_and_filter_map(point_path: str, color_path: str):
     coords = points * SCALE_FACTOR  # (N, 3) in metres
 
     world_x = coords[:, 0]
+    world_y = coords[:, 1]
     world_z = coords[:, 2]
-    # We don't need world_y any more (vertical) after filtering
 
     # ------------------------------------------------------------------
-    # 3. Rasterize to a 2D image  (x → column, z → row)
+    # 3. Establish a shared coordinate origin from ALL points (full extent),
+    #    then rasterize two separate maps:
+    #      • semantic map  – all non-ceiling/floor points (rich colours)
+    #      • occupancy map – height-filtered points only (doorways stay open)
     # ------------------------------------------------------------------
-    x_min, x_max = world_x.min(), world_x.max()
-    z_min, z_max = world_z.min(), world_z.max()
-
-    # Add a small margin so edge points don't fall exactly on the border
     margin = 0.5  # metres
-    origin_x = x_min - margin
-    origin_z = z_min - margin
+    origin_x = world_x.min() - margin
+    origin_z = world_z.min() - margin
 
-    img_w = int(np.ceil((x_max - origin_x + margin) * MAP_RESOLUTION))
-    img_h = int(np.ceil((z_max - origin_z + margin) * MAP_RESOLUTION))
+    img_w = int(np.ceil((world_x.max() - origin_x + margin) * MAP_RESOLUTION))
+    img_h = int(np.ceil((world_z.max() - origin_z + margin) * MAP_RESOLUTION))
 
-    # Pixel indices for every point
-    px = ((world_x - origin_x) * MAP_RESOLUTION).astype(int)
-    pz = ((world_z - origin_z) * MAP_RESOLUTION).astype(int)
+    def _to_px(wx, wz):
+        px_ = np.clip(((wx - origin_x) * MAP_RESOLUTION).astype(int), 0, img_w - 1)
+        pz_ = np.clip(((wz - origin_z) * MAP_RESOLUTION).astype(int), 0, img_h - 1)
+        return px_, pz_
 
-    # Clip to valid range
-    px = np.clip(px, 0, img_w - 1)
-    pz = np.clip(pz, 0, img_h - 1)
-
-    # Build the colour map image  (row = z-pixel, col = x-pixel)
+    # --- Semantic colour map (all points) ---
+    px_all, pz_all = _to_px(world_x, world_z)
     map_img = np.zeros((img_h, img_w, 3), dtype=np.float64)
-    count = np.zeros((img_h, img_w), dtype=np.float64)
-
-    # Use np.add.at so overlapping points accumulate; we average later.
-    np.add.at(map_img, (pz, px), colors.astype(np.float64))
-    np.add.at(count, (pz, px), 1.0)
-
-    # Average and normalise to [0, 1]
-    occupied_mask = count > 0
-    map_img[occupied_mask] /= count[occupied_mask, np.newaxis]
-    map_img /= 255.0  # → [0, 1]
+    count_all = np.zeros((img_h, img_w), dtype=np.float64)
+    np.add.at(map_img, (pz_all, px_all), colors.astype(np.float64))
+    np.add.at(count_all, (pz_all, px_all), 1.0)
+    occupied_mask = count_all > 0
+    map_img[occupied_mask] /= count_all[occupied_mask, np.newaxis]
+    map_img /= 255.0
     map_img = map_img.astype(np.float32)
 
-    # ------------------------------------------------------------------
-    # 4. Build occupancy map
-    #    Occupied pixel = any projected point landed there → obstacle.
-    #    Free pixel = nothing projected → navigable.
-    #    Then we inflate obstacles so the agent doesn't clip walls.
-    # ------------------------------------------------------------------
-    raw_occupied = (count > 0).astype(np.uint8) * 255
+    # --- Height-filtered points for occupancy ---
+    height_keep = (world_y >= floor_y_world + HEIGHT_FILTER_LOW) & \
+                  (world_y <= floor_y_world + HEIGHT_FILTER_HIGH)
+    px_hf, pz_hf = _to_px(world_x[height_keep], world_z[height_keep])
+    count_hf = np.zeros((img_h, img_w), dtype=np.float64)
+    np.add.at(count_hf, (pz_hf, px_hf), 1.0)
+    raw_occupied = (count_hf >= OBSTACLE_POINT_THRESHOLD).astype(np.uint8) * 255
 
     # Invert: for navigation the *empty* space is navigable.
     # But "obstacle" in the occupancy map should be the walls/objects.
     # The projected points *are* the walls/furniture surfaces, so they
     # are the obstacles.  Free space has no points.
     # We inflate the obstacle regions so the agent keeps a safe distance.
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (2 * OBSTACLE_INFLATE_RADIUS + 1, 2 * OBSTACLE_INFLATE_RADIUS + 1),
-    )
-    occupancy_map = cv2.dilate(raw_occupied, kernel, iterations=1)
+    if OBSTACLE_INFLATE_RADIUS > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * OBSTACLE_INFLATE_RADIUS + 1, 2 * OBSTACLE_INFLATE_RADIUS + 1),
+        )
+        occupancy_map = cv2.dilate(raw_occupied, kernel, iterations=1)
+    else:
+        occupancy_map = raw_occupied
 
     return map_img, occupancy_map, (origin_x, origin_z), MAP_RESOLUTION
 
@@ -138,21 +142,59 @@ def world_to_pixel(world_x: float, world_z: float,
 # Existing template functions (unchanged)
 # ------------------------------------------------------------------
 
+def semantic_map_to_uint8(map_img: np.ndarray,
+                          white_background: bool = True,
+                          remove_isolated: bool = True) -> np.ndarray:
+    """Convert a float semantic map to uint8 for visualization."""
+    img = (map_img * 255).astype(np.uint8)
+    if remove_isolated:
+        occupied = ~np.all(img == 0, axis=2)
+        neighbor_count = cv2.filter2D(
+            occupied.astype(np.uint8),
+            -1,
+            np.ones((3, 3), dtype=np.uint8),
+            borderType=cv2.BORDER_CONSTANT,
+        )
+        img[occupied & (neighbor_count <= 1)] = 0
+    if white_background:
+        empty = np.all(img == 0, axis=2)
+        img[empty] = 255
+    return img
+
+
+def _display_image(map_img: np.ndarray) -> np.ndarray:
+    """Return an enlarged uint8 image for OpenCV display."""
+    img = semantic_map_to_uint8(map_img)
+    if DISPLAY_SCALE == 1:
+        return img
+    return cv2.resize(
+        img,
+        None,
+        fx=DISPLAY_SCALE,
+        fy=DISPLAY_SCALE,
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+
 def select_start(map_img: np.ndarray) -> Tuple[int, int]:
     """Display map and return user-clicked start coordinate."""
     start_point = []
 
     def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            start_point.append((x, y))
-            print(f"Start selected: ({x}, {y})")
+            map_x = min(map_img.shape[1] - 1, max(0, x // DISPLAY_SCALE))
+            map_y = min(map_img.shape[0] - 1, max(0, y // DISPLAY_SCALE))
+            start_point.append((map_x, map_y))
+            print(f"Start selected: ({map_x}, {map_y})")
 
-    cv2.namedWindow("Select Start")
+    display = _display_image(map_img)
+    cv2.namedWindow("Select Start", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Select Start", display.shape[1], display.shape[0])
     cv2.setMouseCallback("Select Start", mouse_callback)
     print("Click on the map window to select a start location...")
 
     while True:
-        cv2.imshow("Select Start", (map_img * 255).astype(np.uint8))
+        cv2.imshow("Select Start", display)
         key = cv2.waitKey(1) & 0xFF
         if start_point:
             break
