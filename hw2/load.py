@@ -61,11 +61,11 @@ def make_simple_cfg(settings):
     rgb_sensor_spec.sensor_type = habitat_sim.SensorType.COLOR
     rgb_sensor_spec.resolution = [settings["height"], settings["width"]]
     rgb_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
-    rgb_sensor_spec.orientation = [
-        settings["sensor_pitch"],
+    rgb_sensor_spec.orientation = np.array([
+        float(settings["sensor_pitch"]),
         0.0,
         0.0,
-    ]
+    ], dtype=np.float32)
     rgb_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     #depth snesor
@@ -74,11 +74,7 @@ def make_simple_cfg(settings):
     depth_sensor_spec.sensor_type = habitat_sim.SensorType.DEPTH
     depth_sensor_spec.resolution = [settings["height"], settings["width"]]
     depth_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
-    depth_sensor_spec.orientation = [
-        settings["sensor_pitch"],
-        0.0,
-        0.0,
-    ]
+    depth_sensor_spec.orientation = np.array([float(settings["sensor_pitch"]), 0.0, 0.0], dtype=np.float32)
     depth_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     #semantic snesor
@@ -87,11 +83,7 @@ def make_simple_cfg(settings):
     semantic_sensor_spec.sensor_type = habitat_sim.SensorType.SEMANTIC
     semantic_sensor_spec.resolution = [settings["height"], settings["width"]]
     semantic_sensor_spec.position = [0.0, settings["sensor_height"], 0.0]
-    semantic_sensor_spec.orientation = [
-        settings["sensor_pitch"],
-        0.0,
-        0.0,
-    ]
+    semantic_sensor_spec.orientation = np.array([float(settings["sensor_pitch"]), 0.0, 0.0], dtype=np.float32)
     semantic_sensor_spec.sensor_subtype = habitat_sim.SensorSubType.PINHOLE
 
     agent_cfg.sensor_specifications = [rgb_sensor_spec, depth_sensor_spec, semantic_sensor_spec]
