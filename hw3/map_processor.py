@@ -5,11 +5,27 @@ from typing import List, Tuple
 SCALE_FACTOR = 10000.0 / 255.0
 CEILING_COLOR = np.array([8, 255, 214])
 FLOOR_COLOR = np.array([255, 194, 7])
+STAIR_COLOR = np.array([173, 255, 0])
 
 MAP_RESOLUTION = 10  # pixels per world-meter
-OBSTACLE_POINT_THRESHOLD = 3  # Ignore very sparse projected points in occupancy.
-OBSTACLE_INFLATE_RADIUS = 0  # Keep doorways open; increase only if navigation clips walls.
+OBSTACLE_POINT_THRESHOLD = 4  # Ignore sparse projected points while preserving obstacles.
+OBSTACLE_INFLATE_RADIUS = 1  # 1px inflate covers furniture edge phantoms while keeping doorways open (with DOOR_CARVES).
+SEMANTIC_BLOCK_INFLATE_RADIUS = 2  # Always block stairs/unsafe semantic regions.
 DISPLAY_SCALE = 3  # Enlarge OpenCV map windows without changing map coordinates.
+DOOR_CARVES = [   # (pixel_xy, radius) — carve real doorways blocked by sparse projection points
+    ((50, 15), 2),   # top room ↔ main
+    ((81, 21), 2),   # upper-right pocket ↔ main
+    ((68, 44), 2),   # upper-right room ↔ main
+    ((19, 58), 2),   # left corridor ↔ main
+    ((62, 64), 2),   # central doorway (was radius 1)
+    ((85, 59), 1),   # rack/stair right strip ↔ main (1.4px gap)
+    ((55, 93), 2),   # rack room ↔ main
+    ((73, 112), 2),  # rack room lower ↔ main
+    ((94, 142), 2),  # bottom-right room ↔ main
+    ((56, 147), 2),  # bottom strip ↔ main
+]
+USE_FLOOR_FREE_SPACE = True
+FLOOR_FREE_DILATE_RADIUS = 4
 # Height above floor level to include as obstacles (metres).
 # Excludes floor clutter below 5 cm and anything above standing height.
 HEIGHT_FILTER_LOW = 0.05
@@ -45,7 +61,10 @@ def load_and_filter_map(point_path: str, color_path: str):
 
     # Determine floor height from floor-coloured points so we can apply a
     # height filter that keeps only obstacle-level geometry (walls, furniture).
-    floor_y_world = np.median((points[floor_mask] * SCALE_FACTOR)[:, 1])
+    floor_coords = points[floor_mask] * SCALE_FACTOR
+    floor_y_world = np.median(floor_coords[:, 1])
+    floor_world_x = floor_coords[:, 0]
+    floor_world_z = floor_coords[:, 2]
 
     keep = ~(ceil_mask | floor_mask)
     points = points[keep]
@@ -98,6 +117,41 @@ def load_and_filter_map(point_path: str, color_path: str):
     np.add.at(count_hf, (pz_hf, px_hf), 1.0)
     raw_occupied = (count_hf >= OBSTACLE_POINT_THRESHOLD).astype(np.uint8) * 255
 
+    # Use observed floor as the navigable prior.  This makes doorways clearer:
+    # free space is where first-floor floor points exist, then obstacles are
+    # subtracted from it.  Unknown empty space outside rooms is not navigable.
+    if USE_FLOOR_FREE_SPACE:
+        px_floor, pz_floor = _to_px(floor_world_x, floor_world_z)
+        floor_free = np.zeros((img_h, img_w), dtype=np.uint8)
+        floor_free[pz_floor, px_floor] = 255
+        if FLOOR_FREE_DILATE_RADIUS > 0:
+            floor_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (
+                    2 * FLOOR_FREE_DILATE_RADIUS + 1,
+                    2 * FLOOR_FREE_DILATE_RADIUS + 1,
+                ),
+            )
+            floor_free = cv2.dilate(floor_free, floor_kernel, iterations=1)
+
+    # Stairs lead away from the first floor, so keep them non-navigable even
+    # when the generic point-count threshold is relaxed to preserve doorways.
+    stair_mask = np.all(colors == STAIR_COLOR, axis=1)
+    if np.any(stair_mask):
+        px_stair, pz_stair = _to_px(world_x[stair_mask], world_z[stair_mask])
+        semantic_block = np.zeros((img_h, img_w), dtype=np.uint8)
+        semantic_block[pz_stair, px_stair] = 255
+        if SEMANTIC_BLOCK_INFLATE_RADIUS > 0:
+            block_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (
+                    2 * SEMANTIC_BLOCK_INFLATE_RADIUS + 1,
+                    2 * SEMANTIC_BLOCK_INFLATE_RADIUS + 1,
+                ),
+            )
+            semantic_block = cv2.dilate(semantic_block, block_kernel, iterations=1)
+        raw_occupied = cv2.bitwise_or(raw_occupied, semantic_block)
+
     # Invert: for navigation the *empty* space is navigable.
     # But "obstacle" in the occupancy map should be the walls/objects.
     # The projected points *are* the walls/furniture surfaces, so they
@@ -108,9 +162,22 @@ def load_and_filter_map(point_path: str, color_path: str):
             cv2.MORPH_ELLIPSE,
             (2 * OBSTACLE_INFLATE_RADIUS + 1, 2 * OBSTACLE_INFLATE_RADIUS + 1),
         )
-        occupancy_map = cv2.dilate(raw_occupied, kernel, iterations=1)
+        obstacle_map = cv2.dilate(raw_occupied, kernel, iterations=1)
     else:
-        occupancy_map = raw_occupied
+        obstacle_map = raw_occupied
+
+    if USE_FLOOR_FREE_SPACE:
+        occupancy_map = np.full((img_h, img_w), 255, dtype=np.uint8)
+        occupancy_map[floor_free > 0] = 0
+        occupancy_map[obstacle_map > 0] = 255
+    else:
+        occupancy_map = obstacle_map
+
+    # The point-cloud projection can leave one-pixel false obstacles in narrow
+    # doorways.  Carve only verified doorway pixels instead of relaxing the
+    # whole map, so walls and stairs remain blocked.
+    for (cx, cy), radius in DOOR_CARVES:
+        cv2.circle(occupancy_map, (cx, cy), radius, 0, -1)
 
     return map_img, occupancy_map, (origin_x, origin_z), MAP_RESOLUTION
 

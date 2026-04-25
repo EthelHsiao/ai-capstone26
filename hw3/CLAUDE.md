@@ -167,3 +167,101 @@ Improve RRT (e.g., RRT*, Bi-RRT, path smoothing) and compare with baseline
 - Navigator initial heading is π → agent initially faces -z direction
 - Turn steps = degrees of angle difference (1° per step)
 - Forward steps = distance / MOVE_AMOUNT (0.1 m per step)
+
+---
+
+## Experiment.md Maintenance Rules
+
+`Experiment.md` is the running experiment/debug notebook for this homework. Keep it updated whenever code, parameters, map processing, path planning, visualization, or navigation behavior changes.
+
+### When to Update
+
+Update `Experiment.md` immediately after any of the following:
+
+1. A bug or unexpected behavior is observed.
+2. A parameter is changed.
+3. A code fix is applied.
+4. A fix partially works but does not fully solve the issue.
+5. The debugging direction changes because the previous attempt failed.
+6. A representative run produces useful logs, screenshots, or metrics.
+7. A final configuration is chosen for demo/report.
+
+### What to Record for Each Issue
+
+For every debug item, write the following fields:
+
+```markdown
+### N. Short issue title
+
+**狀態:** 已解決 / 部分解決 / 未解決 / 觀察中
+
+**現象**
+- What happened?
+- Include exact console error/log if available.
+- Include start pixel, target, goal pixel, and screenshot reference if relevant.
+
+**原因**
+- Current hypothesis or confirmed root cause.
+- Mention whether the problem came from semantic map, occupancy map, goal selection, RRT, smoothing, coordinate conversion, or Habitat navigation.
+
+**嘗試歷程**
+1. First attempted fix and result.
+2. If it failed or only partially worked, say so explicitly.
+3. Explain why we changed direction.
+
+**解決方法 / 目前做法**
+- Code/parameter changes.
+- File/function names if useful.
+- Important parameter values.
+
+**驗證**
+- Logs/metrics proving whether it worked.
+- If not fully verified, write what still needs to be checked.
+
+**需要保留的 log / 截圖**
+- Exact logs the user should paste.
+- Screenshots needed for report/debug comparison.
+```
+
+### Required Logs to Preserve
+
+For each meaningful run, preserve these when available:
+
+- `Start pixel`, `Goal pixel`, and target name
+- `[RRT] Path found...` or `[RRT] Failed...`
+- `[Grid] Fallback...` if fallback is used
+- `[Smooth] Reduced path...`
+- `Waypoints on this route`
+- `Experiment summary`
+- `Navigation summary`
+- `Target mask visible...` / `target_seen_frames`
+- RRT Path screenshot, especially if the path looks wrong
+- Habitat RGB screenshot when target red mask is visible
+
+### How to Mark Incomplete Fixes
+
+Do not write a failed or partial attempt as fully solved. Use language such as:
+
+- `狀態: 部分解決`
+- `此方法改善了 X，但仍然造成 Y`
+- `因此改為嘗試 ...`
+- `尚待確認: ...`
+- `下一次請貼: ...`
+
+Examples:
+
+- If increasing `OBSTACLE_POINT_THRESHOLD` connects a route but causes path to cross stairs, record both the improvement and the new failure.
+- If a goal-selection fix prevents false success but causes disconnected errors, mark it as partial and record the next direction.
+- If a visual path looks like it crosses an object, record whether it crosses gray occupancy overlay or only colored semantic pixels.
+
+### Current Important Debug Themes
+
+Keep tracking these until final demo configuration is stable:
+
+- Doorway connectivity vs. obstacle correctness
+- Floor-based free-space quality
+- Whether smoothing shortcuts through obstacles
+- Rack goal side selection
+- Stair blocking for first-floor-only navigation
+- Whether target mask appears in Habitat navigation
+ 

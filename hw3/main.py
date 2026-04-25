@@ -1,6 +1,7 @@
 import math
 import random
 import sys
+from collections import deque
 from typing import List, Optional, Tuple
 
 import cv2
@@ -13,6 +14,7 @@ from map_processor import (
     MAP_RESOLUTION,
     OBSTACLE_INFLATE_RADIUS,
     OBSTACLE_POINT_THRESHOLD,
+    DOOR_CARVES,
     load_and_filter_map,
     select_start,
     get_goal_pixels,
@@ -25,7 +27,7 @@ from navigator import MOVE_AMOUNT, TURN_AMOUNT
 
 POINT_CLOUD_DATA = "semantic_3d_pointcloud/point.npy"
 COLOR_DATA = "semantic_3d_pointcloud/color0255.npy"
-RRT_MAX_ITER = 8000
+RRT_MAX_ITER = 20000
 RRT_STEP_SIZE = 15
 RRT_GOAL_BIAS = 0.20
 RRT_GOAL_TOLERANCE = 15
@@ -34,7 +36,16 @@ VERBOSE = False
 SHOW_TARGET_TABLE = True
 SHOW_PARAMETERS = True
 SHOW_WAYPOINTS = True
+SHOW_OCCUPANCY_OVERLAY = True
+SHOW_FREE_SPACE_TINT = True
 GOAL_MAX_SEARCH_RADIUS = 45
+GOAL_MIN_STANDOFF = 4
+GOAL_PREFERRED_STANDOFF = 10
+TARGET_GOAL_DIRECTIONS = {
+    # Rack is mounted near the wall between the lower-right and middle-right
+    # rooms. Prefer the middle-room side instead of the lower-room wall side.
+    "rack": (0.0, -1.0),
+}
 RRT_LAST_STATS = {}
 
 # Semantic colour and index dictionaries for five required target categories.
@@ -240,6 +251,51 @@ def smooth_path(path: List[Tuple[int, int]],
     return smoothed
 
 
+def grid_fallback_path(start: Tuple[int, int],
+                       goal: Tuple[int, int],
+                       occupancy_map: np.ndarray) -> Optional[List[Tuple[int, int]]]:
+    """Find a reliable 8-connected grid path when RRT misses a narrow route."""
+    h, w = occupancy_map.shape[:2]
+    if not _is_free(occupancy_map, start[0], start[1]):
+        return None
+    if not _is_free(occupancy_map, goal[0], goal[1]):
+        return None
+
+    neighbours = [
+        (1, 0), (-1, 0), (0, 1), (0, -1),
+        (1, 1), (1, -1), (-1, 1), (-1, -1),
+    ]
+    q = deque([start])
+    parent = {start: None}
+
+    while q:
+        x, y = q.popleft()
+        if (x, y) == goal:
+            path = []
+            cur: Optional[Tuple[int, int]] = goal
+            while cur is not None:
+                path.append(cur)
+                cur = parent[cur]
+            path.reverse()
+            print(f"[Grid] Fallback path found with {len(path)} waypoints.")
+            return path
+
+        for dx, dy in neighbours:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < w and 0 <= ny < h):
+                continue
+            nxt = (nx, ny)
+            if nxt in parent:
+                continue
+            if occupancy_map[ny, nx] != 0:
+                continue
+            parent[nxt] = (x, y)
+            q.append(nxt)
+
+    print("[Grid] Fallback failed; no connected free-space path exists.")
+    return None
+
+
 def path_length(path: List[Tuple[float, float]]) -> float:
     """Return total polyline length for 2D waypoints."""
     return sum(
@@ -309,6 +365,7 @@ def print_experiment_summary(goal_prompt: str,
 # =====================================================================
 
 def visualize_path(map_img: np.ndarray,
+                   occupancy_map: np.ndarray,
                    path: List[Tuple[int, int]],
                    start: Tuple[int, int],
                    goal: Tuple[int, int],
@@ -317,6 +374,13 @@ def visualize_path(map_img: np.ndarray,
     base = semantic_map_to_uint8(map_img)
     if base.ndim == 2:
         base = cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+    if SHOW_FREE_SPACE_TINT:
+        free = occupancy_map == 0
+        empty = np.all(base == 255, axis=2)
+        base[free & empty] = np.array([245, 248, 230], dtype=np.uint8)
+    if SHOW_OCCUPANCY_OVERLAY:
+        obstacle = occupancy_map > 0
+        base[obstacle] = (0.7 * base[obstacle] + 0.3 * np.array([80, 80, 80])).astype(np.uint8)
 
     display = cv2.resize(
         base,
@@ -384,6 +448,72 @@ def visualize_path(map_img: np.ndarray,
     cv2.waitKey(0)
     cv2.destroyWindow(window_name)
     return display
+
+
+# =====================================================================
+# Occupancy map display
+# =====================================================================
+
+def show_occupancy_map(map_img: np.ndarray,
+                       occupancy_map: np.ndarray,
+                       window_name: str = "Occupancy Map") -> None:
+    """Show the occupancy map in a separate non-blocking window.
+
+    Colour legend:
+      light grey  = free space (RRT can walk here)
+      dark grey   = obstacle
+      red         = phantom: coloured in semantic map but free in occupancy
+                    (furniture edges that crossed under the point threshold)
+      coloured dot = semantic target centroid
+    """
+    h, w = occupancy_map.shape[:2]
+
+    vis = np.full((h, w, 3), 30, dtype=np.uint8)          # default: obstacle
+    vis[occupancy_map == 0] = [200, 200, 200]              # free = light grey
+
+    # Phantom pixels: coloured in semantic map but not an obstacle
+    colored = ~np.all(map_img < (5 / 255.0), axis=2)
+    phantom = colored & (occupancy_map == 0)
+    vis[phantom] = [60, 60, 220]                           # red-ish in BGR
+
+    # Draw each target's centroid as a small labelled dot
+    target_draw_colors = {
+        "rack":    (0, 220, 0),
+        "cooktop": (0, 220, 220),
+        "sofa":    (220, 50, 50),
+        "cushion": (220, 50, 220),
+        "stair":   (50, 160, 255),
+    }
+    for name in SEMANTIC_DICTS["colors"]:
+        try:
+            pixels = get_goal_pixels(map_img, SEMANTIC_DICTS["colors"], name)
+        except ValueError:
+            continue
+        xs = [p[0] for p in pixels]
+        ys = [p[1] for p in pixels]
+        cx, cy = int(round(sum(xs) / len(xs))), int(round(sum(ys) / len(ys)))
+        draw_c = target_draw_colors.get(name, (255, 255, 255))
+        cv2.circle(vis, (cx, cy), 3, draw_c, -1)
+        cv2.putText(vis, name[:3], (cx + 3, cy - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.25, draw_c, 1, cv2.LINE_AA)
+
+    big = cv2.resize(vis, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE,
+                     interpolation=cv2.INTER_NEAREST)
+
+    # Add legend text
+    legend = [
+        ("light grey = free",    (200, 200, 200)),
+        ("dark grey  = obstacle", (80, 80, 80)),
+        ("blue-red   = phantom",  (60, 60, 220)),
+    ]
+    for i, (text, col) in enumerate(legend):
+        cv2.putText(big, text, (6, 14 + i * 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, big.shape[1], big.shape[0])
+    cv2.imshow(window_name, big)
+    cv2.waitKey(1)   # non-blocking: just pump the event queue so the window appears
 
 
 # =====================================================================
@@ -466,6 +596,7 @@ def _line_clear(blocker_map: np.ndarray,
 
 def _find_visible_goal_pixel(map_img: np.ndarray,
                              occupancy_map: np.ndarray,
+                             goal_name: str,
                              goal_pixels: List[Tuple[int, int]],
                              start: Tuple[int, int],
                              labels: np.ndarray,
@@ -495,31 +626,67 @@ def _find_visible_goal_pixel(map_img: np.ndarray,
         iterations=1,
     ).astype(bool)
 
+    sx, sy = start
+    target_points = [(int(x), int(y)) for x, y in goal_pixels if 0 <= x < w and 0 <= y < h]
+    if not target_points:
+        return None
+    target_cx = float(np.mean([p[0] for p in target_points]))
+    target_cy = float(np.mean([p[1] for p in target_points]))
+    preferred_direction = TARGET_GOAL_DIRECTIONS.get(goal_name)
+
+    # Grow outwards from the target through non-blocker cells.  Unlike square
+    # radius search, this cannot "jump" across a semantic wall to the next room.
+    visited = np.zeros((h, w), dtype=bool)
+    q = deque()
+    for x, y in target_points:
+        visited[y, x] = True
+        q.append((x, y, 0))
+
+    target_array = np.array(target_points, dtype=np.float32)
     best_score = float("inf")
     best_goal: Optional[Tuple[int, int]] = None
-    sx, sy = start
+    neighbours = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
-    for tx, ty in goal_pixels:
-        for r in range(1, GOAL_MAX_SEARCH_RADIUS + 1):
-            for dy in range(-r, r + 1):
-                for dx in range(-r, r + 1):
-                    if max(abs(dx), abs(dy)) != r:
-                        continue
-                    x, y = tx + dx, ty + dy
-                    if not (0 <= x < w and 0 <= y < h):
-                        continue
-                    if occupancy_map[y, x] != 0:
-                        continue
-                    if labels[y, x] != target_region:
-                        continue
-                    if not _line_clear(blocker_map, (x, y), (tx, ty)):
-                        continue
+    while q:
+        x, y, dist = q.popleft()
+        if dist > GOAL_MAX_SEARCH_RADIUS:
+            continue
 
-                    start_dist = math.hypot(x - sx, y - sy)
-                    score = r * 2.0 + start_dist * 0.05
-                    if score < best_score:
-                        best_score = score
-                        best_goal = (int(x), int(y))
+        if occupancy_map[y, x] == 0 and labels[y, x] == target_region:
+            nearest_target_dist = float(
+                np.min(np.hypot(target_array[:, 0] - x, target_array[:, 1] - y))
+            )
+            if nearest_target_dist >= GOAL_MIN_STANDOFF:
+                # Prefer a human-looking standoff distance instead of hugging
+                # the wall/object, then mildly prefer shorter travel from start.
+                standoff_penalty = abs(nearest_target_dist - GOAL_PREFERRED_STANDOFF)
+                start_dist = math.hypot(x - sx, y - sy)
+                score = standoff_penalty * 3.0 + dist * 0.5 + start_dist * 0.03
+                if preferred_direction is not None:
+                    vx = x - target_cx
+                    vy = y - target_cy
+                    norm = math.hypot(vx, vy)
+                    if norm > 1e-6:
+                        dx_pref, dy_pref = preferred_direction
+                        alignment = (vx / norm) * dx_pref + (vy / norm) * dy_pref
+                        if alignment <= 0:
+                            continue
+                        score -= alignment * 20.0
+                if score < best_score:
+                    best_score = score
+                    best_goal = (int(x), int(y))
+
+        for dx, dy in neighbours:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < w and 0 <= ny < h):
+                continue
+            if visited[ny, nx]:
+                continue
+            if blocker_map[ny, nx] and not target_mask[ny, nx]:
+                continue
+            visited[ny, nx] = True
+            q.append((nx, ny, dist + 1))
+
     return best_goal
 
 
@@ -542,6 +709,7 @@ def pick_goal(map_img: np.ndarray,
     visible_goal = _find_visible_goal_pixel(
         map_img,
         occupancy_map,
+        goal_prompt,
         goal_pixels,
         start,
         labels,
@@ -549,6 +717,13 @@ def pick_goal(map_img: np.ndarray,
     )
     if visible_goal is not None:
         return goal_prompt, visible_goal
+
+    if goal_prompt in TARGET_GOAL_DIRECTIONS:
+        print(
+            f"[Goal] ERROR: no reachable goal found on the preferred side of '{goal_prompt}'. "
+            "The target-side room is disconnected in the current occupancy map."
+        )
+        sys.exit(1)
 
     # Fallback for unusual starts: choose any nearby free pixel.
     print("[Goal] WARNING: no visible goal pixel found; using nearest reachable free pixel.")
@@ -615,6 +790,7 @@ def main():
             f"OBSTACLE_POINT_THRESHOLD={OBSTACLE_POINT_THRESHOLD}, "
             f"OBSTACLE_INFLATE_RADIUS={OBSTACLE_INFLATE_RADIUS}, "
             f"HEIGHT_FILTER=({HEIGHT_FILTER_LOW}, {HEIGHT_FILTER_HIGH}), "
+            f"DOOR_CARVES={DOOR_CARVES}, "
             f"DISPLAY_SCALE={DISPLAY_SCALE}"
         )
     map_img, occupancy_map, world_origin, resolution = load_and_filter_map(
@@ -624,6 +800,7 @@ def main():
           f"resolution={resolution} px/m")
     if SHOW_TARGET_TABLE or VERBOSE:
         print_target_locations(map_img, world_origin, resolution)
+    show_occupancy_map(map_img, occupancy_map)
 
     # === Step 2: Select start & goal ===
     print("\n=== Step 2: Selecting Agent Start and Goal Positions ===")
@@ -650,8 +827,11 @@ def main():
         goal_tolerance=RRT_GOAL_TOLERANCE,
     )
     if not path:
-        print("Planner could not find a path.")
-        sys.exit(1)
+        print("[RRT] Falling back to grid search for this connected but narrow route.")
+        path = grid_fallback_path(start, goal, occupancy_map)
+        if not path:
+            print("Planner could not find a path.")
+            sys.exit(1)
     raw_path = path
 
     # Optional: smooth the path to remove zig-zags
@@ -659,7 +839,7 @@ def main():
 
     # === Step 4: Visualise ===
     print("\n=== Step 4: Visualizing the Planned Path ===")
-    visualize_path(map_img, path, start, goal)
+    visualize_path(map_img, occupancy_map, path, start, goal)
 
     # === Step 5: Convert to world coords & navigate ===
     print("\n=== Step 5: Translating Path to Habitat Simulator ===")
