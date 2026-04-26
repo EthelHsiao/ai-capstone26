@@ -7,11 +7,12 @@ CEILING_COLOR = np.array([8, 255, 214])
 FLOOR_COLOR = np.array([255, 194, 7])
 STAIR_COLOR = np.array([173, 255, 0])
 
-MAP_RESOLUTION = 10  # pixels per world-meter
-OBSTACLE_POINT_THRESHOLD = 4  # Ignore sparse projected points while preserving obstacles.
-OBSTACLE_INFLATE_RADIUS = 1  # 1px inflate covers furniture edge phantoms while keeping doorways open (with DOOR_CARVES).
-SEMANTIC_BLOCK_INFLATE_RADIUS = 2  # Always block stairs/unsafe semantic regions.
+MAP_RESOLUTION = 20  # pixels per world-meter
+OBSTACLE_POINT_THRESHOLD = 1  # Conservative: keep sparse furniture as obstacles; open verified doors manually.
+OBSTACLE_INFLATE_RADIUS = 1  # Keep this small; large inflation closes narrow doorways.
+SEMANTIC_BLOCK_INFLATE_RADIUS = 1  # Always block stairs/unsafe semantic regions.
 DISPLAY_SCALE = 3  # Enlarge OpenCV map windows without changing map coordinates.
+DOOR_CLEANUP_MODE = "auto"  # "none", "manual", "auto", or "both"
 DOOR_CARVES = [   # (pixel_xy, radius) — carve real doorways blocked by sparse projection points
     ((50, 15), 2),   # top room ↔ main
     ((81, 21), 2),   # upper-right pocket ↔ main
@@ -21,15 +22,66 @@ DOOR_CARVES = [   # (pixel_xy, radius) — carve real doorways blocked by sparse
     ((85, 59), 1),   # rack/stair right strip ↔ main (1.4px gap)
     ((55, 93), 2),   # rack room ↔ main
     ((73, 112), 2),  # rack room lower ↔ main
+    ((146, 121), 3), # user-provided camera pose doorway world=(3.753, 0.245)
     ((94, 142), 2),  # bottom-right room ↔ main
     ((56, 147), 2),  # bottom strip ↔ main
 ]
 USE_FLOOR_FREE_SPACE = True
 FLOOR_FREE_DILATE_RADIUS = 4
+AUTO_DOOR_MAX_BLOB_AREA = 18
+AUTO_DOOR_MAX_BLOB_THICKNESS = 3
+AUTO_DOOR_CONTEXT_RADIUS = 3
+AUTO_DOOR_MIN_FLOOR_RATIO = 0.65
 # Height above floor level to include as obstacles (metres).
-# Excludes floor clutter below 5 cm and anything above standing height.
+# Excludes floor clutter below 5 cm and anything above the agent's camera/body
+# height (1.5 m = SENSOR_HEIGHT in navigator.py) — points above that cannot
+# physically collide with the agent, and removing them opens up door-frame tops.
 HEIGHT_FILTER_LOW = 0.05
-HEIGHT_FILTER_HIGH = 2.2
+HEIGHT_FILTER_HIGH = 1.5
+
+
+def _auto_clear_door_noise(obstacle_map: np.ndarray,
+                           floor_free: np.ndarray,
+                           protected_obstacles: np.ndarray) -> np.ndarray:
+    """Remove tiny obstacle blobs that only interrupt continuous floor space."""
+    floor = floor_free > 0
+    protected = protected_obstacles > 0
+    candidates = (obstacle_map > 0) & floor & ~protected
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        candidates.astype(np.uint8),
+        connectivity=8,
+    )
+
+    cleaned = obstacle_map.copy()
+    cleared = 0
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area <= 0 or area > AUTO_DOOR_MAX_BLOB_AREA:
+            continue
+
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if min(w, h) > AUTO_DOOR_MAX_BLOB_THICKNESS:
+            continue
+
+        x0 = max(0, x - AUTO_DOOR_CONTEXT_RADIUS)
+        y0 = max(0, y - AUTO_DOOR_CONTEXT_RADIUS)
+        x1 = min(obstacle_map.shape[1], x + w + AUTO_DOOR_CONTEXT_RADIUS)
+        y1 = min(obstacle_map.shape[0], y + h + AUTO_DOOR_CONTEXT_RADIUS)
+
+        context = floor[y0:y1, x0:x1]
+        floor_ratio = float(np.count_nonzero(context)) / float(context.size)
+        if floor_ratio < AUTO_DOOR_MIN_FLOOR_RATIO:
+            continue
+
+        cleaned[labels == label] = 0
+        cleared += area
+
+    if cleared:
+        print(f"[Map] Auto-cleared {cleared} doorway-noise obstacle pixels.")
+    return cleaned
 
 
 def load_and_filter_map(point_path: str, color_path: str):
@@ -136,10 +188,10 @@ def load_and_filter_map(point_path: str, color_path: str):
 
     # Stairs lead away from the first floor, so keep them non-navigable even
     # when the generic point-count threshold is relaxed to preserve doorways.
+    semantic_block = np.zeros((img_h, img_w), dtype=np.uint8)
     stair_mask = np.all(colors == STAIR_COLOR, axis=1)
     if np.any(stair_mask):
         px_stair, pz_stair = _to_px(world_x[stair_mask], world_z[stair_mask])
-        semantic_block = np.zeros((img_h, img_w), dtype=np.uint8)
         semantic_block[pz_stair, px_stair] = 255
         if SEMANTIC_BLOCK_INFLATE_RADIUS > 0:
             block_kernel = cv2.getStructuringElement(
@@ -151,6 +203,15 @@ def load_and_filter_map(point_path: str, color_path: str):
             )
             semantic_block = cv2.dilate(semantic_block, block_kernel, iterations=1)
         raw_occupied = cv2.bitwise_or(raw_occupied, semantic_block)
+
+    # Doorway projection noise is easiest to identify before dilation: after
+    # inflation a tiny false obstacle can merge into real walls or furniture.
+    if USE_FLOOR_FREE_SPACE and DOOR_CLEANUP_MODE in ("auto", "both"):
+        raw_occupied = _auto_clear_door_noise(
+            raw_occupied,
+            floor_free,
+            semantic_block,
+        )
 
     # Invert: for navigation the *empty* space is navigable.
     # But "obstacle" in the occupancy map should be the walls/objects.
@@ -176,8 +237,9 @@ def load_and_filter_map(point_path: str, color_path: str):
     # The point-cloud projection can leave one-pixel false obstacles in narrow
     # doorways.  Carve only verified doorway pixels instead of relaxing the
     # whole map, so walls and stairs remain blocked.
-    for (cx, cy), radius in DOOR_CARVES:
-        cv2.circle(occupancy_map, (cx, cy), radius, 0, -1)
+    if DOOR_CLEANUP_MODE in ("manual", "both"):
+        for (cx, cy), radius in DOOR_CARVES:
+            cv2.circle(occupancy_map, (cx, cy), radius, 0, -1)
 
     return map_img, occupancy_map, (origin_x, origin_z), MAP_RESOLUTION
 
