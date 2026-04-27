@@ -37,7 +37,7 @@ RRT_STEP_SIZE = 15
 RRT_GOAL_BIAS = 0.20
 RRT_GOAL_TOLERANCE = 15
 RANDOM_SEED = None  # Set an int, e.g. 7, when you want repeatable experiments.
-USE_SMOOTH_PATH = False  # Toggle the greedy short-cut smoothing pass; turn off
+USE_SMOOTH_PATH = True  # Toggle the greedy short-cut smoothing pass; turn off
                         # to navigate the raw RRT waypoints (more turns, but no
                         # corner-cutting which can clip furniture edges).
 VERBOSE = False
