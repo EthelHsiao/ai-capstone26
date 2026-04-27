@@ -49,10 +49,12 @@ SHOW_FREE_SPACE_TINT = True
 GOAL_MAX_SEARCH_RADIUS = 45
 GOAL_MIN_STANDOFF = 4
 GOAL_PREFERRED_STANDOFF = 10
+STAIR_BOTTOM_BAND_PX = 6
 TARGET_GOAL_DIRECTIONS = {
     # Rack is mounted near the wall between the lower-right and middle-right
     # rooms. Prefer the middle-room side instead of the lower-room wall side.
     "rack": (0.0, -1.0),
+
 }
 RRT_LAST_STATS = {}
 
@@ -641,12 +643,20 @@ def _find_visible_goal_pixel(map_img: np.ndarray,
     target_cx = float(np.mean([p[0] for p in target_points]))
     target_cy = float(np.mean([p[1] for p in target_points]))
     preferred_direction = TARGET_GOAL_DIRECTIONS.get(goal_name)
+    stair_bottom_y: Optional[int] = None
+    search_points = target_points
+    if goal_name == "stair":
+        stair_bottom_y = max(y for _, y in target_points)
+        search_points = [
+            (x, y) for x, y in target_points
+            if y >= stair_bottom_y - STAIR_BOTTOM_BAND_PX
+        ]
 
     # Grow outwards from the target through non-blocker cells.  Unlike square
     # radius search, this cannot "jump" across a semantic wall to the next room.
     visited = np.zeros((h, w), dtype=bool)
     q = deque()
-    for x, y in target_points:
+    for x, y in search_points:
         visited[y, x] = True
         q.append((x, y, 0))
 
@@ -661,6 +671,8 @@ def _find_visible_goal_pixel(map_img: np.ndarray,
             continue
 
         if occupancy_map[y, x] == 0 and labels[y, x] == target_region:
+            if stair_bottom_y is not None and y <= stair_bottom_y:
+                continue
             nearest_target_dist = float(
                 np.min(np.hypot(target_array[:, 0] - x, target_array[:, 1] - y))
             )

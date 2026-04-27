@@ -81,21 +81,19 @@ map_img[count_all > 0] /= count_all[count_all > 0, None]
 map_img /= 255.0                  # final shape (H, W, 3) float32 in [0, 1]
 
 # Occupancy map: keep only points in a sensible height range
-height_keep = (world_y >= floor_y + 0.05) & (world_y <= floor_y + 2.2)
+height_keep = (world_y >= floor_y + HEIGHT_FILTER_LOW) & \
+              (world_y <= floor_y + HEIGHT_FILTER_HIGH)
 np.add.at(count_hf, (pz_hf, px_hf), 1)
 raw_occupied = (count_hf >= OBSTACLE_POINT_THRESHOLD).astype(np.uint8) * 255
 ```
 
 The **semantic map** keeps every projected point so the colours stay vivid and `get_goal_pixels()` can find rack/sofa/etc. easily. Sparse furniture edges (a chair leg projecting only one or two points) get painted in. That's fine for visualisation but **terrible for planning** — the planner would see the chair leg as a coloured pixel in otherwise free space and happily route through it.
 
-The **occupancy map** is built from a stricter subset:
+The **occupancy map** is built from a height-filtered subset:
 
-- **Height filter `[0.05, 2.2] m` above the floor.** The lower bound (5 cm) trims floor clutter such as carpet edges and shadow projections. The upper bound (2.2 m) trims hanging lamps and points that have leaked from the upper floor. The value 2.2 m was chosen as "tall enough to cover a person plus a small safety margin" while still excluding ceiling fixtures.
+- **Height filter `[0.05, 1.5] m` above the floor.** The lower bound (5 cm) trims floor clutter such as carpet edges and shadow projections. The upper bound is close to the camera/body height of the agent. This was important because the upper parts of door frames behave like ceiling-level geometry: they should not block a ground robot in the 2D occupancy map. Lowering this value opened several doorways without manual carving.
 
-- **Point-count threshold `≥ 3`.** A pixel becomes an obstacle only if at least 3 different points landed on it. This is the single most impactful parameter:
-  - At 1: every stray reflection becomes a wall, doors are completely sealed.
-  - At 5: real but thin walls become transparent and the planner cuts through them.
-  - At 3: noisy thin reflections disappear, real walls survive.
+- **Point-count threshold `≥ 1`.** After the height filter was tightened, I could use a conservative threshold and keep sparse furniture/wall points as obstacles. This reduces the chance that the planner cuts through thin objects.
 
 ### 2.5 Floor-based free space (the second map insight)
 
@@ -120,13 +118,13 @@ The dilation radius of 4 was determined empirically: 2 left holes inside rooms, 
 STAIR_COLOR = np.array([173, 255, 0])
 stair_mask = np.all(colors == STAIR_COLOR, axis=1)
 semantic_block[pz_stair, px_stair] = 255
-semantic_block = cv2.dilate(semantic_block, ellipse(2*1 + 1))
+semantic_block = cv2.dilate(semantic_block, ellipse(2*2 + 1))
 raw_occupied = cv2.bitwise_or(raw_occupied, semantic_block)
 ```
 
 The spec restricts navigation to the first floor, so the robot must not climb the stairs. This is enforced by **always** marking stair-coloured pixels as obstacles, regardless of point density or height. Without this safeguard, lowering `OBSTACLE_POINT_THRESHOLD` to keep doors open caused the staircase to become sparse enough to count as free, and the planner sometimes routed the agent onto the steps.
 
-### 2.7 Auto-clearing doorway noise
+### 2.7 Doorway cleanup attempts
 
 ```python
 def _auto_clear_door_noise(obstacle_map, floor_free, protected_obstacles):
@@ -134,7 +132,7 @@ def _auto_clear_door_noise(obstacle_map, floor_free, protected_obstacles):
     n, labels, stats, _ = cv2.connectedComponentsWithStats(candidates.astype(np.uint8), 8)
     for label in range(1, n):
         area = stats[label, cv2.CC_STAT_AREA]
-        if area > AUTO_DOOR_MAX_BLOB_AREA:           # 6 px
+        if area > AUTO_DOOR_MAX_BLOB_AREA:           # 18 px
             continue
         # 3-pixel ring around the blob must be ≥ 65% floor
         if floor_ratio < AUTO_DOOR_MIN_FLOOR_RATIO:  # 0.65
@@ -143,28 +141,26 @@ def _auto_clear_door_noise(obstacle_map, floor_free, protected_obstacles):
     return cleaned
 ```
 
-Even with floor-based free space and a sensible threshold, around ten doorways in apartment_0 are blocked by 1–4 pixel obstacle blobs — door frames that happen to project a few extra points right in the middle of the opening. An earlier solution used a hand-curated `DOOR_CARVES` list with each problem doorway marked manually. That approach worked but did not generalise: every parameter change shifted some carves by a pixel or two and required re-locating them.
+Doorways were the hardest part of the map. My first solution was manual carving: I found blocked door pixels by hand and opened them with `DOOR_CARVES`. This helped in one map, but it was not general. Small changes in resolution, inflation, or filtering shifted the doorway pixels, so the list had to be edited again.
 
-The auto routine identifies these blobs by two criteria:
-1. **Tiny size:** a blob ≤ 6 pixels. Real walls are giant connected blobs; furniture has dozens of pixels at minimum.
-2. **Surrounded by floor:** the 3-pixel ring around the blob must be ≥ 65% floor pixels. Walls fail this because they have other walls next to them; furniture fails because it has obstacles on its own footprint. Only "small dot floating in the middle of a doorway" passes both.
+I also tried an automatic cleanup routine. It removes small and thin obstacle blobs when the surrounding area is mostly floor. The hope was that tiny noisy projections inside doorways would be removed automatically.
 
-Stairs are explicitly protected via `protected_obstacles`, so they never get cleared even though they look like small blobs to the algorithm.
+In practice, this was not reliable enough. Some blocked doors were still not opened, while some real furniture edges and wall fragments looked similar to doorway noise. The rule only sees local blob size and floor ratio, so it cannot always tell a false doorway obstacle from a real obstacle.
 
-This is why the current `DOOR_CLEANUP_MODE = "auto"` — the manual `DOOR_CARVES` list still exists in the code as a fallback / documentation of known-bad spots, but auto handles the day-to-day cases.
+The final solution is simpler: `DOOR_CLEANUP_MODE = "none"` and the high obstacle filter is set to 1.5 m. This removes high door-frame points together with ceiling-level geometry, which opened the doorways much more cleanly.
 
 ### 2.8 Final occupancy assembly
 
 ```python
 if OBSTACLE_INFLATE_RADIUS > 0:
-    obstacle_map = cv2.dilate(raw_occupied, ellipse(2*1 + 1))   # +1 px = 5 cm
+    obstacle_map = cv2.dilate(raw_occupied, ellipse(2*2 + 1))   # +2 px = 10 cm
 
 occupancy_map = np.full((H, W), 255, dtype=np.uint8)   # default: NOT walkable
 occupancy_map[floor_free > 0] = 0                       # floor → walkable
 occupancy_map[obstacle_map > 0] = 255                   # obstacles override
 ```
 
-The order matters. The map starts with everything blocked, floor regions are then marked free, and any obstacle pixels are re-blocked on top. An obstacle on top of a floor pixel therefore always wins. The 1-pixel obstacle dilation adds a 5 cm safety margin without sealing 50–70 cm doorways.
+The order matters. The map starts with everything blocked, floor regions are then marked free, and any obstacle pixels are re-blocked on top. An obstacle on top of a floor pixel therefore always wins. The final obstacle dilation is 2 pixels, or 10 cm. This kept the executed Habitat path farther from furniture and reduced collisions during navigation.
 
 ### 2.9 Pixel ↔ world conversion
 
@@ -241,10 +237,7 @@ def smooth_path(path, occupancy_map):
     return smoothed
 ```
 
-RRT paths zig-zag because every node was placed by random sampling. After RRT finishes, a greedy shortcut pass is applied: from each waypoint, the algorithm walks **backwards** through the path and finds the **furthest** waypoint that is still reachable by a straight line, then skips everything in between. Typical reductions:
-
-- Raw RRT path: 30–80 waypoints
-- Smoothed: 5–10 waypoints
+RRT paths zig-zag because every node was placed by random sampling. After RRT finishes, a greedy shortcut pass is applied: from each waypoint, the algorithm walks **backwards** through the path and finds the **furthest** waypoint that is still reachable by a straight line, then skips everything in between. In the final 10-case experiment, smoothing reduced the waypoint count by 61.7% on average.
 
 This makes Habitat execution much smoother — the agent walks in long straight runs rather than dithering at each random RRT node.
 
@@ -297,7 +290,17 @@ TARGET_GOAL_DIRECTIONS = {"rack": (0.0, -1.0)}   # prefer the -z side
 
 Rack is wall-mounted with valid free pixels on **both** sides, and without this rule the planner picks whichever side the BFS reaches first — sometimes the wrong room. With the rule, candidates on the −z side receive a bonus of up to 20 in the score, while candidates on the +z side are filtered out entirely.
 
-If everything fails (start and target are in different connected components), the script prints an error rather than navigating into the wrong room.
+Stair needed a different rule. The stair object covers a large region, so searching from all stair pixels can choose a nearby side point instead of the desired standing point below the stairs. For `stair`, I first keep only the bottom band of stair pixels:
+
+```python
+STAIR_BOTTOM_BAND_PX = 6
+search_points = [(x, y) for x, y in stair_pixels
+                 if y >= stair_bottom_y - STAIR_BOTTOM_BAND_PX]
+```
+
+The BFS starts from this lower band, and candidate goals must be below the stair bottom. This makes the goal land in the free space at the bottom of the stairs.
+
+If the visible-goal search fails for normal objects, the code falls back to the nearest reachable free pixel near the target. For objects with strict side requirements, such as rack, it reports an error instead of navigating to the wrong side.
 
 ### 2.14 Visualising the path
 
@@ -354,106 +357,119 @@ Each frame renders the **RGB image** and the **semantic image**, then overlays a
 | Parameter | Value | Meaning |
 |---|---|---|
 | MAP_RESOLUTION | 20 px/m | 5 cm per pixel |
-| OBSTACLE_POINT_THRESHOLD | 3 | 3+ points → call it a wall |
-| OBSTACLE_INFLATE_RADIUS | 1 px | 5 cm safety margin |
+| OBSTACLE_POINT_THRESHOLD | 1 | keep sparse wall/furniture points |
+| OBSTACLE_INFLATE_RADIUS | 2 px | 10 cm safety margin |
+| SEMANTIC_BLOCK_INFLATE_RADIUS | 2 px | keep stairs safely blocked |
 | FLOOR_FREE_DILATE_RADIUS | 4 px | 20 cm fill of floor |
-| HEIGHT_FILTER_LOW / HIGH | 0.05 / 2.2 m | trim floor clutter / ceiling |
-| AUTO_DOOR_MAX_BLOB_AREA | 6 px | tiny door noise threshold |
-| AUTO_DOOR_MIN_FLOOR_RATIO | 0.65 | surroundings must be mostly floor |
+| HEIGHT_FILTER_LOW / HIGH | 0.05 / 1.5 m | trim floor clutter / high door-frame points |
+| DOOR_CLEANUP_MODE | none | final map uses height filtering instead of carving |
 | RRT_STEP_SIZE | 15 px | 75 cm per extension |
 | RRT_GOAL_BIAS | 0.20 | 20% biased samples |
 | RRT_GOAL_TOLERANCE | 15 px | 75 cm goal-reach radius |
-| RRT_MAX_ITER | 20000 | budget; in practice ~1000 was enough |
+| RRT_MAX_ITER | 20000 | planning budget |
 
 ### 3.2 Test cases
 
-I tested all five required targets from various clicked start positions.
+I tested two start points and all five required targets. These cases are not meant to be ranked directly, because each target has a different location and surrounding geometry. Instead, they show how RRT behaves in different indoor layouts.
 
-#### 3.2.1 Rack
+The first start point `(95, 188)` is in a more open area. Nearby targets such as sofa and cushion produce short, direct paths. The second start point `(145, 105)` is inside a smaller room, so the planner often needs to leave through a doorway before moving toward the target. This creates longer paths with more turns.
 
-![Rack RRT path](images/rack_path.png)
+| Start | Target | Goal pixel | RRT Iter | waypoints | Path (m) | Turn° | predicted actions | Success |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| (95, 188) | rack | (140, 178) | 76 | 3 | 2.32 | 13.0° | 59 | ✓ |
+| (95, 188) | cooktop | (63, 81) | 842 | 7 | 11.07 | 332.8° | 554 | ✓ |
+| (95, 188) | sofa | (95, 263) | 13 | 2 | 3.75 | 0.0° | 75 | ✓ |
+| (95, 188) | cushion | (107, 281) | 14 | 2 | 4.69 | 0.0° | 94 | ✓ |
+| (95, 188) | stair | (175, 256) | 200 | 4 | 7.84 | 185.2° | 342 | ✓ |
+| (145, 105) | rack | (145, 177) | 13 | 5 | 3.84 | 93.2° | 170 | ✓ |
+| (145, 105) | cooktop | (63, 81) | 13 | 4 | 4.89 | 84.5° | 183 | ✓ |
+| (145, 105) | sofa | (95, 263) | 195 | 9 | 14.31 | 274.5° | 561 | ✓ |
+| (145, 105) | cushion | (107, 281) | 85 | 5 | 9.63 | 94.8° | 288 | ✓ |
+| (145, 105) | stair | (151, 235) | 287 | 5 | 11.09 | 215.1° | 437 | ✓ |
 
-- The hardest case. Rack is wall-mounted between two rooms and the wrong side has free space too. Without `TARGET_GOAL_DIRECTIONS["rack"]`, the planner used to put the goal in the next room over.
-- Typical RRT iterations: ~XXX, raw waypoints: ~XX, smoothed: ~X.
-- Habitat: the red mask appears on the rack in the final ~XX frames.
+Representative examples:
 
-#### 3.2.2 Cooktop
+![Open-area start to sofa](experiments/start_target/start_095-188_sofa.png)
 
-![Cooktop RRT path](images/cooktop_path.png)
+![Small-room start to sofa](experiments/start_target/start_145-105_sofa.png)
 
-The closest target. RRT converges in well under 500 iterations and the smoothed path is just 3–4 waypoints.
-
-#### 3.2.3 Sofa
-
-![Sofa RRT path](images/sofa_path.png)
-
-Sofa has hundreds of coloured pixels, so `get_goal_pixels()` returns a big list. The visibility BFS picks a sensible standoff right in front of the seat.
-
-#### 3.2.4 Cushion
-
-![Cushion RRT path](images/cushion_path.png)
-
-Unusual because there are 9 separate cushion instances in `info_semantic.json`. I supply all the indices `[431, 430, 400, 350, 149, 151, 205, 251, 223]` and the navigator overlays any one of them as "the cushion". The planner picks whichever is reachable and on the same side as the start.
-
-#### 3.2.5 Stair
-
-![Stair RRT path](images/stair_path.png)
-
-Slightly meta: stairs are *also* obstacles in my occupancy map, so the agent must reach the **front** of the stairs without ever stepping on them. The visibility BFS handles this naturally — it finds the first free pixel in front of the bottom step.
+The table shows that open-area cases are usually direct, while room-to-room cases require more turns. It also shows why goal selection matters: rack and stair need goals on the correct side of the object, not simply the nearest object pixel.
 
 ### 3.3 What I observed during navigation
-
-![Habitat RGB with red mask](images/habitat_rgb.png)
 
 When the agent arrives, the target usually fills a substantial part of the screen and the red overlay is clear. A few honest observations:
 
 - **The agent doesn't always face the target perfectly** at the end. My waypoint logic only orients toward the *next waypoint*, not toward the target. Improving this would mean adding a final "rotate to target centroid" step.
 - **target_seen_frames is occasionally 0 for cushion** when the path doesn't pass through a room where any cushion is at standing height. Cushions are small and partly occluded by the sofa.
-- **Smoothing reduction averages 80–90%** — typical raw paths of ~30 waypoints come down to 4–8 after smoothing.
+- **Path smoothing helps execution** — raw RRT paths are jagged, while smoothed paths usually have fewer waypoints and much smaller turning angles.
 - **The grid fallback never fired** with the final parameters; RRT always succeeded within ~1000 iterations.
 
 ---
 
-## 4. Questions
+## 4. Bonus: Improving RRT with Path Smoothing
+
+The original RRT path is valid, but it is usually jagged because the tree is built from random samples. I improved the RRT output by adding a greedy path smoothing step. For each waypoint, the smoother tries to connect directly to a later waypoint. If the straight shortcut is collision-free, the intermediate waypoints are removed.
+
+I used the same two start points and five targets as the previous experiment, for 10 cases total. The raw and smoothed paths use the same map, start, target, and RRT parameters. Only two representative figures are shown here, but the table includes all 10 cases.
+
+![Raw RRT path](experiments/smoothing/start_145-105_stair_raw.png)
+
+![Smoothed RRT path](experiments/smoothing/start_145-105_stair_smooth.png)
+
+| Start | Target | RRT iter | Raw wp | Smooth wp | Raw path (m) | Smooth path (m) | Raw turn (deg) | Smooth turn (deg) | Action reduction |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| (95, 188) | rack | 76 | 5 | 3 | 2.39 | 2.32 | 45.8 | 13.0 | 37.2% |
+| (95, 188) | cooktop | 842 | 23 | 7 | 15.22 | 11.07 | 827.0 | 332.8 | 51.0% |
+| (95, 188) | sofa | 13 | 7 | 2 | 4.10 | 3.75 | 118.8 | 0.0 | 62.7% |
+| (95, 188) | cushion | 14 | 8 | 2 | 4.90 | 4.69 | 103.1 | 0.0 | 53.2% |
+| (95, 188) | stair | 200 | 15 | 4 | 10.11 | 7.84 | 507.7 | 185.2 | 51.8% |
+| (145, 105) | rack | 13 | 7 | 5 | 4.36 | 3.84 | 205.9 | 93.2 | 42.0% |
+| (145, 105) | cooktop | 13 | 8 | 4 | 4.89 | 4.89 | 93.8 | 84.5 | 4.7% |
+| (145, 105) | sofa | 195 | 23 | 9 | 15.74 | 14.31 | 800.7 | 274.5 | 49.7% |
+| (145, 105) | cushion | 85 | 17 | 5 | 11.53 | 9.63 | 624.1 | 94.8 | 66.3% |
+| (145, 105) | stair | 287 | 22 | 5 | 14.72 | 11.09 | 907.8 | 215.1 | 63.6% |
+
+On average, smoothing reduced waypoints by **61.7%**, path length by **12.8%**, total turning angle by **68.6%**, and predicted navigation actions by **48.2%**. The biggest gain is not only shorter distance, but fewer turns. This makes the path easier for the Habitat agent to execute, so I use the smoothed RRT path in the final pipeline.
+
+---
+
+## 5. Questions
 
 ### Q1. How do step size and goal bias affect RRT sampling?
 
 The two parameters together control **exploration vs exploitation**, and the right balance depends on the geometry of the map.
 
-**Step size** is how far each new branch extends. I tested step_size = 5, 15, and 30 pixels (≈ 25, 75, 150 cm).
+**Step size** is how far each new branch extends. I tested step sizes 5, 15, 25, and 35 pixels while keeping `goal_bias = 0.20`.
 
-| step_size | Avg iterations | Avg raw waypoints | Failed runs (out of 10) |
-|---|---|---|---|
-| 5 | ~5000 | ~120 | 0 |
-| 15 | ~800 | ~35 | 0 |
-| 30 | ~400 | ~15 | 2 (stuck at narrow doorways) |
+| Case | step size | goal bias | RRT Iterations | waypoints | Path length (m) | total turn angle | success |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A1 | 5 | 0.20 | 962 ± 642 | 6.8 ± 1.8 | 10.72 ± 4.60 | 242.1° ± 105.4° | 5/5 |
+| A2 | 15 | 0.20 | 381 ± 307 | 6.0 ± 1.0 | 12.84 ± 5.03 | 209.0° ± 67.0° | 5/5 |
+| A3 | 25 | 0.20 | 109 ± 76 | 5.8 ± 0.8 | 7.56 ± 0.27 | 175.3° ± 63.0° | 5/5 |
+| A4 | 35 | 0.20 | 643 ± 344 | 7.0 ± 2.3 | 13.40 ± 5.06 | 274.4° ± 123.6° | 5/5 |
 
-A small step size makes the tree dense — the planner can squeeze through any gap that's wider than one pixel, but each extension covers very little ground, so getting from one side of the apartment to the other takes thousands of iterations. A large step size sweeps the map faster but **skips over** small openings: at 30 pixels, a 10-pixel-wide door is impossible because the line from parent to child crosses the door frame.
-
-I settled on 15 because at MAP_RESOLUTION=20 it equals 75 cm — wider than one of the agent's forward strides but narrower than the smallest doorway (~70 cm). It was the smallest value where iteration counts stayed under ~2000 reliably.
+The result roughly follows the expected U-shape. A very small step makes slow progress, while a very large step causes more rejected edges around narrow passages. `step_size = 25` performed best in this fixed rack experiment, but I kept `step_size = 15` in the final demo because it is more conservative across different start-target pairs.
 
 **Goal bias** is the probability that the random sample is replaced with the goal coordinate.
 
-| goal_bias | Avg iterations | Behaviour |
-|---|---|---|
-| 0.05 | ~3000 | uniform exploration; paths zig-zag a lot |
-| 0.20 | ~800 | balanced |
-| 0.50 | ~600 (when it works) | tree slams into walls trying to head straight |
-| 0.90 | often fails | tree barely explores, can't go around obstacles |
+| Case | step size | goal bias | RRT Iterations | waypoints | Path length (m) | total turn angle | success |
+|---|---:|---:|---:|---:|---:|---:|---|
+| B1 | 15 | 0.05 | 221 ± 121 | 6.6 ± 1.1 | 11.07 ± 4.33 | 251.2° ± 80.9° | 5/5 |
+| A2 | 15 | 0.20 | 381 ± 307 | 6.0 ± 1.0 | 12.84 ± 5.03 | 209.0° ± 67.0° | 5/5 |
+| B2 | 15 | 0.50 | 593 ± 437 | 5.8 ± 0.8 | 7.94 ± 0.65 | 180.5° ± 55.6° | 5/5 |
+| B3 | 15 | 0.80 | 2483 ± 3059 | 7.4 ± 2.8 | 13.03 ± 5.34 | 280.9° ± 191.7° | 5/5 |
 
-Low bias gives an unbiased random tree that fills space evenly. The path eventually reaches the goal but takes lots of iterations. High bias keeps pushing toward the goal — great in open space but disastrous in cluttered rooms, where the tree wastes attempts trying to grow through the same wall over and over.
-
-Theoretically, RRT is **probabilistically complete**: given infinite iterations, even a zero goal bias finds a path if one exists. In practice we want it to converge in a budget, so 15–30% goal bias is the sweet spot recommended by the original Kuffner & LaValle paper. My empirical 0.20 lines up with that.
+The effect of goal bias is mostly about variance. A moderate or high bias can produce a clean path when the goal direction is useful, but a very high bias becomes unstable when walls block the direct route. In B3, one unlucky seed took thousands of iterations, which made the standard deviation very large. The final implementation uses `goal_bias = 0.20` as a safer trade-off.
 
 ### Q2. What challenges does indoor navigation face in the real world?
 
-Our simulator gives us a near-perfect setup: ground-truth poses, a static prebuilt point cloud, no sensor noise, perfect actuation. The real world breaks all four assumptions.
+Our simulator gives us a near-perfect setup: ground-truth poses, a static prebuilt point cloud, clean semantic labels, and perfect actuation. The real world breaks these assumptions.
 
 1. **Localisation drift.** Habitat reports the agent's position exactly. A real robot has to estimate its own position from wheel encoders, IMU, and visual SLAM, all of which drift over time. After a few minutes of navigation the reported position can be off by tens of centimetres. Loop-closure SLAM and Monte-Carlo localisation against a known map are the standard fixes.
 
 2. **Dynamic obstacles.** Our occupancy map is built once. In a real apartment, doors open and close, chairs move, people walk through. Planners need to update the occupancy from live sensor readings (typically a costmap that decays old observations) and re-plan when the path is blocked.
 
-3. **Sensor noise.** Real depth cameras give noisy point clouds: surfaces shimmer, dark or glossy materials return no points, edges produce phantom flying pixels. Building a clean occupancy map from real data needs filtering — statistical outlier removal, voxel down-sampling, temporal smoothing. My `OBSTACLE_POINT_THRESHOLD` is a primitive form of this, but real systems use proper probabilistic occupancy grids.
+3. **Sensor noise.** Real depth cameras give noisy point clouds: surfaces shimmer, dark or glossy materials return no points, edges produce phantom flying pixels. Building a clean occupancy map from real data needs filtering — statistical outlier removal, voxel down-sampling, temporal smoothing. I used thresholds and height filtering to make this dataset work, but these rules are not general enough for a real robot.
 
 4. **Actuation error.** Habitat moves the agent exactly 5 cm on a `move_forward` command. Real wheels slip, surface friction varies, heading drifts. Closed-loop controllers (PID on linear/angular velocity) and re-localisation between waypoints become necessary.
 
@@ -465,7 +481,7 @@ In short, simulation gets you the **algorithm**; the real world adds **estimatio
 
 ---
 
-## 5. References
+## 6. References
 
 - LaValle, S. M. (2006). *Planning Algorithms.* Cambridge University Press. — Chapter 5 (RRT).
 - Kuffner, J. J., & LaValle, S. M. (2000). RRT-Connect: An efficient approach to single-query path planning. *Proc. IEEE ICRA 2000.*
