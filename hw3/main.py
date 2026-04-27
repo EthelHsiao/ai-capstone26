@@ -49,10 +49,12 @@ SHOW_FREE_SPACE_TINT = True
 GOAL_MAX_SEARCH_RADIUS = 45
 GOAL_MIN_STANDOFF = 4
 GOAL_PREFERRED_STANDOFF = 10
+STAIR_BOTTOM_BAND_PX = 6
 TARGET_GOAL_DIRECTIONS = {
     # Rack is mounted near the wall between the lower-right and middle-right
     # rooms. Prefer the middle-room side instead of the lower-room wall side.
     "rack": (0.0, -1.0),
+
 }
 RRT_LAST_STATS = {}
 
@@ -641,12 +643,20 @@ def _find_visible_goal_pixel(map_img: np.ndarray,
     target_cx = float(np.mean([p[0] for p in target_points]))
     target_cy = float(np.mean([p[1] for p in target_points]))
     preferred_direction = TARGET_GOAL_DIRECTIONS.get(goal_name)
+    stair_bottom_y: Optional[int] = None
+    search_points = target_points
+    if goal_name == "stair":
+        stair_bottom_y = max(y for _, y in target_points)
+        search_points = [
+            (x, y) for x, y in target_points
+            if y >= stair_bottom_y - STAIR_BOTTOM_BAND_PX
+        ]
 
     # Grow outwards from the target through non-blocker cells.  Unlike square
     # radius search, this cannot "jump" across a semantic wall to the next room.
     visited = np.zeros((h, w), dtype=bool)
     q = deque()
-    for x, y in target_points:
+    for x, y in search_points:
         visited[y, x] = True
         q.append((x, y, 0))
 
@@ -661,6 +671,8 @@ def _find_visible_goal_pixel(map_img: np.ndarray,
             continue
 
         if occupancy_map[y, x] == 0 and labels[y, x] == target_region:
+            if stair_bottom_y is not None and y <= stair_bottom_y:
+                continue
             nearest_target_dist = float(
                 np.min(np.hypot(target_array[:, 0] - x, target_array[:, 1] - y))
             )
@@ -694,6 +706,28 @@ def _find_visible_goal_pixel(map_img: np.ndarray,
                 continue
             visited[ny, nx] = True
             q.append((nx, ny, dist + 1))
+
+    if goal_name == "stair" and best_goal is None and stair_bottom_y is not None:
+        search_array = np.array(search_points, dtype=np.float32)
+        min_x = max(0, min(x for x, _ in search_points) - GOAL_MAX_SEARCH_RADIUS)
+        max_x = min(w - 1, max(x for x, _ in search_points) + GOAL_MAX_SEARCH_RADIUS)
+        max_y = min(h - 1, stair_bottom_y + GOAL_MAX_SEARCH_RADIUS)
+        for y in range(stair_bottom_y + 1, max_y + 1):
+            for x in range(min_x, max_x + 1):
+                if occupancy_map[y, x] != 0 or labels[y, x] != target_region:
+                    continue
+                nearest_seed_dist = float(
+                    np.min(np.hypot(search_array[:, 0] - x, search_array[:, 1] - y))
+                )
+                if nearest_seed_dist < GOAL_MIN_STANDOFF:
+                    continue
+                standoff_penalty = abs(nearest_seed_dist - GOAL_PREFERRED_STANDOFF)
+                center_penalty = abs(x - target_cx) * 0.05
+                bottom_penalty = (y - stair_bottom_y) * 0.2
+                score = standoff_penalty * 3.0 + center_penalty + bottom_penalty
+                if score < best_score:
+                    best_score = score
+                    best_goal = (int(x), int(y))
 
     return best_goal
 
