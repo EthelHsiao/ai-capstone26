@@ -1,6 +1,7 @@
 import math
 import random
 import sys
+import time
 from collections import deque
 from typing import List, Optional, Tuple
 
@@ -36,6 +37,9 @@ RRT_STEP_SIZE = 15
 RRT_GOAL_BIAS = 0.20
 RRT_GOAL_TOLERANCE = 15
 RANDOM_SEED = None  # Set an int, e.g. 7, when you want repeatable experiments.
+USE_SMOOTH_PATH = False  # Toggle the greedy short-cut smoothing pass; turn off
+                        # to navigate the raw RRT waypoints (more turns, but no
+                        # corner-cutting which can clip furniture edges).
 VERBOSE = False
 SHOW_TARGET_TABLE = True
 SHOW_PARAMETERS = True
@@ -751,19 +755,55 @@ def pick_goal(map_img: np.ndarray,
     sys.exit(1)
 
 
+def path_turn_total_deg(world_path: List[Tuple[float, float]]) -> float:
+    """Total absolute turning angle (degrees) needed to follow a polyline."""
+    if len(world_path) < 3:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(world_path) - 1):
+        dx0 = world_path[i][0] - world_path[i - 1][0]
+        dz0 = world_path[i][1] - world_path[i - 1][1]
+        dx1 = world_path[i + 1][0] - world_path[i][0]
+        dz1 = world_path[i + 1][1] - world_path[i][1]
+        if math.hypot(dx0, dz0) < 1e-9 or math.hypot(dx1, dz1) < 1e-9:
+            continue
+        h0 = math.atan2(-dx0, -dz0)
+        h1 = math.atan2(-dx1, -dz1)
+        diff = h1 - h0
+        while diff > math.pi:
+            diff -= 2 * math.pi
+        while diff < -math.pi:
+            diff += 2 * math.pi
+        total += abs(math.degrees(diff))
+    return total
+
+
+def estimate_nav_actions(world_path: List[Tuple[float, float]]):
+    """Predict (forward, turn, total) sim-step counts purely from path geometry."""
+    forward = int(round(path_length(world_path) / MOVE_AMOUNT))
+    turn = int(round(path_turn_total_deg(world_path) / TURN_AMOUNT))
+    return forward, turn, forward + turn
+
+
 def run_in_sim(start_world: Tuple[float, float],
                world_path: List[Tuple[float, float]],
                goal_prompt: str):
     start_x, start_z = start_world
     print(f"Spawning Agent at world position: ({start_x:.3f}, {start_z:.3f})")
 
+    t0 = time.perf_counter()
     sim, agent, _ = init_sim(start_x=start_x, start_z=start_z)
+    init_time = time.perf_counter() - t0
+
+    t1 = time.perf_counter()
     nav_stats = execute_waypoint_path(
         world_path,
         sim,
         agent,
         SEMANTIC_DICTS["indices"][goal_prompt],
     )
+    walk_time = time.perf_counter() - t1
+
     if nav_stats:
         print(
             "Navigation summary: "
@@ -773,6 +813,8 @@ def run_in_sim(start_world: Tuple[float, float],
             f"actions=(forward={nav_stats['forward']}, left={nav_stats['left']}, "
             f"right={nav_stats['right']})"
         )
+
+    return {"init_time": init_time, "walk_time": walk_time, "nav_stats": nav_stats}
 
 
 # =====================================================================
@@ -842,8 +884,12 @@ def main():
             sys.exit(1)
     raw_path = path
 
-    # Optional: smooth the path to remove zig-zags
-    path = smooth_path(path, occupancy_map)
+    # Optional: smooth the path to remove zig-zags. Toggle USE_SMOOTH_PATH
+    # to compare navigation behaviour with and without the short-cut pass.
+    if USE_SMOOTH_PATH:
+        path = smooth_path(path, occupancy_map)
+    else:
+        print(f"[Smooth] Skipped (USE_SMOOTH_PATH=False); using {len(path)} raw RRT waypoints.")
 
     # === Step 4: Visualise ===
     print("\n=== Step 4: Visualizing the Planned Path ===")
@@ -868,7 +914,36 @@ def main():
         occupancy_map,
     )
 
-    run_in_sim(world_path[0], world_path, goal_prompt)
+    sim_result = run_in_sim(world_path[0], world_path, goal_prompt)
+
+    # === Final consolidated log ===
+    world_len_m = path_length(world_path)
+    total_turn_deg = path_turn_total_deg(world_path)
+    forward_pred, turn_pred, total_pred = estimate_nav_actions(world_path)
+    init_time = sim_result["init_time"]
+    walk_time = sim_result["walk_time"]
+    nav_stats = sim_result.get("nav_stats") or {}
+
+    print("\n" + "=" * 60)
+    print("=== FINAL RESULTS ===")
+    print(f"  target              : {goal_prompt}")
+    print(f"  start / goal pixel  : {start} -> {goal}")
+    print(f"  RRT iterations      : {RRT_LAST_STATS.get('iterations')}")
+    print(f"  RRT tree nodes      : {RRT_LAST_STATS.get('nodes')}")
+    print(f"  raw waypoints       : {len(raw_path)}")
+    print(f"  final waypoints     : {len(path)}  (smoothing="
+          f"{'on' if USE_SMOOTH_PATH else 'off'})")
+    print(f"  path length         : {world_len_m:.2f} m")
+    print(f"  total turn angle    : {total_turn_deg:.1f} deg")
+    print(f"  predicted actions   : forward={forward_pred}, "
+          f"turn={turn_pred}, total={total_pred}")
+    if nav_stats:
+        print(f"  actual frames       : {nav_stats.get('frames')}  "
+              f"(target_seen={nav_stats.get('seen_frames')})")
+    print(f"  habitat init time   : {init_time:.2f} s")
+    print(f"  habitat walk time   : {walk_time:.2f} s")
+    print(f"  total wall time     : {init_time + walk_time:.2f} s")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

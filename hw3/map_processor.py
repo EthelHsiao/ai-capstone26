@@ -9,10 +9,10 @@ STAIR_COLOR = np.array([173, 255, 0])
 
 MAP_RESOLUTION = 20  # pixels per world-meter
 OBSTACLE_POINT_THRESHOLD = 1  # Conservative: keep sparse furniture as obstacles; open verified doors manually.
-OBSTACLE_INFLATE_RADIUS = 1  # Keep this small; large inflation closes narrow doorways.
-SEMANTIC_BLOCK_INFLATE_RADIUS = 1  # Always block stairs/unsafe semantic regions.
+OBSTACLE_INFLATE_RADIUS = 2  # Keep this small; large inflation closes narrow doorways.
+SEMANTIC_BLOCK_INFLATE_RADIUS = 2  # Always block stairs/unsafe semantic regions.
 DISPLAY_SCALE = 3  # Enlarge OpenCV map windows without changing map coordinates.
-DOOR_CLEANUP_MODE = "auto"  # "none", "manual", "auto", or "both"
+DOOR_CLEANUP_MODE = "none"  # "none", "manual", "auto", or "both"
 DOOR_CARVES = [   # (pixel_xy, radius) — carve real doorways blocked by sparse projection points
     ((50, 15), 2),   # top room ↔ main
     ((81, 21), 2),   # upper-right pocket ↔ main

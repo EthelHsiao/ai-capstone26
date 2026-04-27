@@ -865,7 +865,7 @@ goal (68, 84)
 
 ### 12. 門口不明顯 / planner 不知道哪裡可以走
 
-**狀態:** 目前已改成 floor-based free-space，但仍需更多 start/target 實測確認是否會造成 free-space 過胖或 smoothing shortcut。
+**狀態:** 目前已改成 floor-based free-space，並新增可切換的 doorway cleanup mode；仍需更多 start/target 實測確認 auto cleanup 是否比 manual carve 穩定。
 
 **現象**
 
@@ -916,6 +916,272 @@ RRT 視覺化也新增 free-space tint，讓 planner 認為能走的地板區域
 5. 目前保留 `DOOR_CARVES = [((62,64),1)]` 修正局部假障礙。
 6. 尚待確認：free-space tint 是否過胖、path 是否因 smoothing 穿過物件邊緣。
 
+**新增 doorway cleanup 模式**
+
+目前 `map_processor.py` 提供：
+
+```python
+DOOR_CLEANUP_MODE = "none"    # 不清門口
+DOOR_CLEANUP_MODE = "manual"  # 只用 DOOR_CARVES 手動清
+DOOR_CLEANUP_MODE = "auto"    # 自動清小而孤立的 obstacle blobs
+DOOR_CLEANUP_MODE = "both"    # auto + manual
+```
+
+Auto cleanup 的想法：
+
+```text
+不要讓少量 obstacle pixels 直接否決連續 floor_free。
+若 obstacle blob 很小、位在 floor_free 裡、周圍也是地板、
+且沒有碰到 stair semantic blocker，就當成 projection noise 清掉。
+```
+
+目前參數：
+
+```python
+AUTO_DOOR_MAX_BLOB_AREA = 18
+AUTO_DOOR_MAX_BLOB_THICKNESS = 3
+AUTO_DOOR_CONTEXT_RADIUS = 3
+AUTO_DOOR_MIN_FLOOR_RATIO = 0.65
+```
+
+**目前測試結果**
+
+在 `MAP_RESOLUTION = 20` 的設定下，auto cleanup 可清掉少量候選假障礙：
+
+```text
+[Map] Auto-cleared 110 doorway-noise obstacle pixels.
+```
+
+但要注意：解析度從 10 改到 20 後，舊的 pixel start/goal 座標不能直接比較。例如舊的 `(89,136)` 可能在新 map 中已經不是同一個物理位置，甚至可能落在 obstacle 上。因此後續比較 `none/manual/auto/both` 時，應使用同一張新 map 上重新點選的 start pixel。
+
+**New observation: threshold tradeoff**
+
+使用者觀察到：
+
+```text
+OBSTACLE_POINT_THRESHOLD = 6
+DOOR_CLEANUP_MODE = "none"
+```
+
+時，某些需要的門口會自然打開；但副作用是一些低矮或點雲較稀疏的家具也會被視為 free，路徑可能走到家具上。
+
+使用較小 threshold 時，家具較容易被保留為 obstacle，但即使用 `DOOR_CLEANUP_MODE = "auto"`，仍有部分門口沒有成功打開。
+
+目前判斷：
+
+```text
+單一全域 threshold 同時控制「門口假障礙」和「家具障礙」是不夠的。
+門口假障礙需要局部清除；家具需要用更保守的 obstacle / semantic blocker 保留。
+```
+
+下一步分析方向：
+
+1. 比較門口假障礙與家具障礙的 blob 面積、形狀、semantic color、height distribution。
+2. 嘗試讓 auto cleanup 在 obstacle inflation 之前處理 raw small blobs，避免小門口雜訊被膨脹後變成大 blob。
+3. 對特定家具語意類別加入 semantic blocker，避免因 threshold 過高而漏掉低矮/稀疏家具。
+4. 若要比較兩處差異，需記錄兩個 pixel 座標：一個門口假障礙、一個被誤判 free 的家具位置。
+
+**2026-04-25 更新：先清 raw obstacle，再做 inflate**
+
+為了處理 `OBSTACLE_POINT_THRESHOLD = 6` 會開門但誤放家具、低 threshold 又會讓門口被堵住的 tradeoff，目前改成：
+
+```python
+MAP_RESOLUTION = 20
+OBSTACLE_POINT_THRESHOLD = 3
+DOOR_CLEANUP_MODE = "auto"
+AUTO_DOOR_MAX_BLOB_AREA = 6
+OBSTACLE_INFLATE_RADIUS = 1
+```
+
+關鍵邏輯調整：
+
+```text
+舊流程：raw obstacle -> inflate -> auto cleanup
+新流程：raw obstacle -> auto cleanup -> inflate
+```
+
+原因：
+
+如果先 inflate，門口的一兩個 false obstacle pixels 會被放大，甚至黏到牆或家具上，auto cleanup 看到的就不再是「小而孤立」的 blob。先在 raw obstacle 階段清理，較能保留「只清門口雜訊、不動大片家具」的判斷。
+
+短測結果：
+
+```text
+[Map] Auto-cleared 371 doorway-noise obstacle pixels.
+params 20 3 auto 6 1
+shape (318, 207) obstacle_ratio 0.597 free_regions 83
+largest_free_area 25023
+```
+
+參數 sweep 摘要：
+
+```text
+threshold=3, AUTO_DOOR_MAX_BLOB_AREA=24 -> cleared 691, obstacle_ratio 0.585
+threshold=3, AUTO_DOOR_MAX_BLOB_AREA=6  -> cleared 371, obstacle_ratio 0.597
+```
+
+目前選 `AUTO_DOOR_MAX_BLOB_AREA = 6` 是比較保守的版本：它仍會清門口 raw 小雜點，但比 24 少清很多，降低誤清家具邊緣/流理台碎片的風險。
+
+尚未完全驗證：
+
+- 右下房間到 rack 的門口是否穩定打開。
+- 流理台/椅子/扁家具是否仍會被誤視為 free。
+- 如果還有特定門口沒開，需要貼該門口 screenshot 或 pixel 座標，再比較門口 blob 和家具 blob 的差異。
+![alt text](image-5.png)
+**2026-04-25 更新：auto cleanup 仍太寬鬆，暫時改回 manual 開門**
+
+使用者回報：
+
+```text
+AUTO cleanup 後仍然太寬鬆，path 會撞到一些家具。
+希望不要動全域，而是找到缺的出口位置後用手動 carve。
+```
+
+目前判斷：
+
+```text
+auto cleanup 雖然能處理門口假障礙，但它仍有機會清掉家具邊緣的小 obstacle blobs。
+在作業 demo 階段，保守地保留家具，再手動打開已確認的門，比全域放鬆更可控。
+```
+
+目前改成：
+
+```python
+OBSTACLE_POINT_THRESHOLD = 2
+DOOR_CLEANUP_MODE = "manual"
+```
+
+並新增 `door_picker.py` 輔助找手動門口座標。使用方式：
+
+```bash
+python door_picker.py
+```
+
+操作：
+
+```text
+Left click: 點想要手動開的出口位置
++/-       : 調整 carve radius
+q / Esc   : 離開
+```
+
+它會印出：
+
+```text
+DOOR_CARVES entry: ((x, y), radius),
+```
+
+把這行貼進 `map_processor.py` 的 `DOOR_CARVES` 即可。注意 `door_picker.py` 顯示時會暫時使用 `DOOR_CLEANUP_MODE="none"`，目的是讓被堵住的門口看得出來。
+
+尚未完全解決：
+
+- 還需要使用者用 `door_picker.py` 點出缺的門口。
+- 若 `threshold=2 + manual` 仍讓某些房間不連通，需要新增對應的 `DOOR_CARVES`。
+- 若 manual carve 後仍撞家具，應優先確認是不是 path smoothing shortcut 或 goal 點太靠近家具，而不是再放寬 occupancy。
+
+**2026-04-25 更新：occupancy map 變胖、門口打不開**
+
+使用者回報：
+
+```text
+occupancy map 變得很胖，什麼門口都開不了。
+```
+
+檢查當時參數：
+
+```python
+OBSTACLE_POINT_THRESHOLD = 2
+OBSTACLE_INFLATE_RADIUS = 5
+DOOR_CLEANUP_MODE = "both"
+```
+
+原因：
+
+`MAP_RESOLUTION = 20` 時，1 pixel 約 0.05 m。`OBSTACLE_INFLATE_RADIUS = 5` 代表每個障礙物往外膨脹約 0.25 m。門口兩側牆壁一起膨脹後，窄門會被直接吃掉；而 `DOOR_CARVES` 多數只有 radius 1-3 px，無法補回 5 px 膨脹造成的堵塞。
+
+當時檢查結果：
+
+```text
+params 20 2 5 both
+obstacle_ratio 0.787
+free_regions 17
+```
+
+解決方法 / 目前做法：
+
+```python
+OBSTACLE_INFLATE_RADIUS = 1
+DOOR_CLEANUP_MODE = "manual"
+```
+
+重新檢查：
+
+```text
+params 20 2 1 manual
+obstacle_ratio 0.644
+free_regions 169
+```
+
+結論：
+
+不要用大 inflation 解「避開家具」問題。大 inflation 會讓整張 occupancy 變胖並關掉門口。家具碰撞問題應優先用：
+
+1. 保守 threshold 保住家具。
+2. 手動 `DOOR_CARVES` 只開真門。
+3. 必要時調 path smoothing / goal standoff，而不是把 obstacle 全圖膨脹到 5。
+
+**2026-04-25 更新：auto door cleanup 清門邊障礙仍不夠**
+
+使用者回報：
+
+```text
+auto door cleanup 對門邊障礙清得還不夠，門口仍有 obstacle。
+```
+
+原因：
+
+先前為了避免誤清家具，把：
+
+```python
+AUTO_DOOR_MAX_BLOB_AREA = 6
+```
+
+設得很保守。這只能清極小的 isolated pixels，但門邊假障礙常常是一段細長條，面積可能超過 6，因此會留下來。
+
+調整方法：
+
+```python
+AUTO_DOOR_MAX_BLOB_AREA = 18
+AUTO_DOOR_MAX_BLOB_THICKNESS = 3
+```
+
+新的 auto 條件變成：
+
+```text
+可以清稍大的 blob，
+但 blob 必須是薄片狀：min(width, height) <= 3。
+```
+
+這樣目標是清掉門邊細條雜訊，而不是把一團家具/流理台障礙也清掉。
+
+短測結果：
+
+```text
+old strict: area<=6                  -> cleared 372, obstacle_ratio 0.596
+new thin : area<=18 and thickness<=3 -> cleared 460, obstacle_ratio 0.593
+loose ref: area<=18 no thickness     -> cleared 624, obstacle_ratio 0.586
+```
+
+目前判斷：
+
+`new thin` 是比較合理的中間版本：比 strict 多清門邊障礙，但比無限制放寬少清許多，降低誤清家具的機率。
+
+尚未完全驗證：
+
+- 需要實跑 `python main.py` 看門口是否真的打開。
+- 若仍撞家具，需貼 path screenshot，判斷是 auto 清太多、inflate 太小、或 smoothing 貼太近。
+- 若某個門仍清不掉，應記錄該門口 pixel，再比較 blob 面積與 thickness。
+
 **驗證**
 
 目前測試：
@@ -941,6 +1207,11 @@ stair goal (72, 108)
 - `floor_free True dilate 4 ... start/rack same True`
 - 若 path 仍穿過灰色 obstacle，貼上 screenshot
 - 下一次請貼：同一張 path 圖，並說明綠線是否穿過灰色 overlay 還是只穿過彩色 semantic object
+- 若比較 doorway cleanup，請貼：
+  - `DOOR_CLEANUP_MODE`
+  - `[Map] Auto-cleared ...`
+  - `Start pixel / Goal pixel`
+  - RRT Path screenshot
 
 ---
 
@@ -1205,3 +1476,17 @@ stair    dist=3px  ✓
 **最後更新:** ___________  
 **實驗者:** ___________  
 **狀態:** ☐ 進行中  ☐ 完成
+
+
+### Expirements
+1. resolution size = 10 -> 20
+![alt text](image-2.png)
+1 pixel 變成約 0.05 m，門口不會被幾個 pixels 這麼容易堵住。
+缺點是 RRT 會變慢，step size / goal tolerance 都要重調。
+而且可能是threshold的關係 解析度變大點會便分散 因此要降低門檻它把比較矮的廚房桌子認為可以走
+2. threhold = 4 -> 2
+![](image-3.png)
+確實劉禮台變得合理 有判斷為障礙 但是右下角房間走出去的地方變得奇怪
+現在改成3
+![alt text](image-4.png)
+3. 
