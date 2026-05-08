@@ -258,12 +258,44 @@ def your_fk(DH_params : dict, q, base_pos) -> np.ndarray:
     # -------------------------------------------------------------------------------- #
     
     #### your code ####
-    
+
+    q = np.asarray(q, dtype=np.float64).reshape(-1)
+    joint_origins = []
+    joint_axes = []
+
+    for joint_id, params in enumerate(DH_params):
+        joint_origins.append(A[:3, 3].copy())
+        joint_axes.append(A[:3, 2].copy())
+
+        theta = q[joint_id]
+        a = float(params['a'])
+        d = float(params['d'])
+        alpha = float(params['alpha'])
+
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+        cos_alpha = np.cos(alpha)
+        sin_alpha = np.sin(alpha)
+
+        T_i = np.asarray([
+            [cos_theta, -sin_theta * cos_alpha,  sin_theta * sin_alpha, a * cos_theta],
+            [sin_theta,  cos_theta * cos_alpha, -cos_theta * sin_alpha, a * sin_theta],
+            [0.0,        sin_alpha,              cos_alpha,             d],
+            [0.0,        0.0,                    0.0,                   1.0],
+        ], dtype=np.float64)
+        A = A @ T_i
+
+    p_end = A[:3, 3].copy()
+
+    for joint_id in range(6):
+        z_i = joint_axes[joint_id]
+        p_i = joint_origins[joint_id]
+        jacobian[:3, joint_id] = cross(z_i, p_end - p_i)
+        jacobian[3:, joint_id] = z_i
 
     # A = ? # may be more than one line
     # jacobian = ? # may be more than one line
 
-    raise NotImplementedError
     # hint : 
     # https://automaticaddison.com/the-ultimate-guide-to-jacobian-matrices-for-robotics/
     

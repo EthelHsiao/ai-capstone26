@@ -133,6 +133,58 @@ def your_ik(new_pose : list or tuple or np.ndarray,
 
     # TODO: update tmp_q using an iterative optimization loop.
     # tmp_q = ? # may be more than one line
+
+    dh_params = get_ur5_DH_params()
+    target_pose = np.asarray(new_pose, dtype=np.float64).reshape(-1)
+    assert target_pose.size == 7, f'new_pose should contain 7 values, got {target_pose.size}'
+
+    target_pos = target_pose[:3]
+    target_rot = R.from_quat(target_pose[3:]).as_matrix()
+    tmp_q = np.clip(tmp_q, joint_limits[:, 0], joint_limits[:, 1])
+
+    def pose_error(q):
+        pose, jacobian = your_fk(dh_params, q, base_pos)
+        pose = np.asarray(pose, dtype=np.float64)
+
+        pos_error = target_pos - pose[:3]
+        current_rot = R.from_quat(pose[3:]).as_matrix()
+        rot_error = R.from_matrix(target_rot @ current_rot.T).as_rotvec()
+        error = np.concatenate([pos_error, rot_error])
+        return error, jacobian
+
+    step_rates = (1.0, 0.5, 0.25, 0.1, 0.05)
+    max_delta_norm = 0.25
+
+    for _ in range(max_iters):
+        error, jacobian = pose_error(tmp_q)
+        error_norm = np.linalg.norm(error)
+        if error_norm < stop_thresh:
+            break
+
+        delta_q = pinv(jacobian) @ error
+        delta_norm = np.linalg.norm(delta_q)
+        if not np.isfinite(delta_norm):
+            break
+        if delta_norm > max_delta_norm:
+            delta_q = delta_q / delta_norm * max_delta_norm
+
+        best_q = tmp_q
+        best_error_norm = error_norm
+
+        for step_rate in step_rates:
+            candidate_q = tmp_q + step_rate * delta_q
+            candidate_q = np.clip(candidate_q, joint_limits[:, 0], joint_limits[:, 1])
+            candidate_error, _ = pose_error(candidate_q)
+            candidate_error_norm = np.linalg.norm(candidate_error)
+
+            if candidate_error_norm < best_error_norm:
+                best_q = candidate_q
+                best_error_norm = candidate_error_norm
+
+        if best_error_norm >= error_norm - 1e-12:
+            break
+
+        tmp_q = best_q
     
     # hint : 
     # 1. You may use `your_fk` function and jacobian matrix to do this
