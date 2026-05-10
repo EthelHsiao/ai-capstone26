@@ -73,19 +73,13 @@ def get_pose_from_matrix(matrix, pose_size : int = 7) -> np.ndarray:
         else:
             rot = R.from_matrix(rot_mat).as_quat()
     except ValueError:
-        # det<=0: project to nearest SO(3) matrix (right-handed, det=+1)
-        # Standard fix: U @ diag(1,1,det(U@Vt)) @ Vt  ensures det=+1
+        # 如果 det<=0，修正成最近正交矩陣
         U, _, Vt = np.linalg.svd(rot_mat)
-        d = np.linalg.det(U @ Vt)
-        rot_mat_fixed = U @ np.diag([1.0, 1.0, d]) @ Vt
-        try:
-            if pose_size == 6:
-                rot = R.from_matrix(rot_mat_fixed).as_rotvec()
-            else:
-                rot = R.from_matrix(rot_mat_fixed).as_quat()
-        except ValueError:
-            # Last resort: identity rotation
-            rot = np.array([0.0, 0.0, 0.0, 1.0]) if pose_size == 7 else np.zeros(3)
+        rot_mat_fixed = U @ Vt
+        if pose_size == 6:
+            rot = R.from_matrix(rot_mat_fixed).as_rotvec()
+        else:
+            rot = R.from_matrix(rot_mat_fixed).as_quat()
 
     return np.asarray(list(pos) + list(rot), dtype=np.float64)
 
@@ -346,20 +340,8 @@ def score_fk(student_fk_function, headless=False, visualize_pose=False):
     except ImportError as exc:
         raise ImportError("Isaac Sim python modules are not available in current environment.") from exc
 
-    #sim_app = SimulationApp({"headless": bool(headless), "width": 1280, "height": 720})
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-    os.environ.setdefault("NVIDIA_VISIBLE_DEVICES", "0")
-    os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "Y")
-    os.environ.setdefault("PRIVACY_CONSENT", "Y")
+    sim_app = SimulationApp({"headless": bool(headless), "width": 1280, "height": 720})
 
-    sim_app = SimulationApp({
-        "headless": bool(headless),
-        "width": 1280,
-        "height": 720,
-        "active_gpu": 0,
-        "physics_gpu": 0,
-        "multi_gpu": False,
-    })
     try:
         from isaacsim.core.api import World
 

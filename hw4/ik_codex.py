@@ -12,10 +12,42 @@ TASK2_SCORE_MAX = 40
 IK_ERROR_THRESH = 0.02
 
 def cross(a : np.ndarray, b : np.ndarray) -> np.ndarray :
+    """Compute the 3D vector cross product.
+
+    Parameters
+    ----------
+    a : np.ndarray
+        First 3D vector.
+    b : np.ndarray
+        Second 3D vector.
+
+    Returns
+    -------
+    np.ndarray
+        Cross product ``a x b``.
+    """
     return np.cross(a, b)
 
 
+
 def _get_initial_q(q_init=None):
+    """Validate and normalize an initial 6-DoF joint vector.
+
+    Parameters
+    ----------
+    q_init : list | tuple | np.ndarray | None
+        Initial joint values. Must contain at least 6 numbers.
+
+    Returns
+    -------
+    np.ndarray
+        Joint vector of shape ``(6,)`` in float64.
+
+    Raises
+    ------
+    ValueError
+        If ``q_init`` is missing or has fewer than 6 elements.
+    """
     if q_init is not None:
         q_init = np.asarray(q_init, dtype=np.float64).reshape(-1)
         if q_init.size < 6:
@@ -28,11 +60,55 @@ def _get_initial_q(q_init=None):
 
 def your_ik(new_pose : list or tuple or np.ndarray, 
                 base_pos, max_iters : int=1000, stop_thresh : float=.001, q_init=None):
-    """Solve inverse kinematics using iterative Jacobian pseudo-inverse updates
-    with random restarts and Damped Least Squares (DLS) regularization.
+    """Solve inverse kinematics using iterative Jacobian pseudo-inverse updates.
+
+    Parameters
+    ----------
+    new_pose : list | tuple | np.ndarray
+        Target end-effector pose in 7D format ``[x, y, z, qx, qy, qz, qw]``.
+    base_pos : list | tuple | np.ndarray
+        Robot base translation in world frame.
+    max_iters : int, default=1000
+        Maximum optimization iterations.
+    stop_thresh : float, default=0.001
+        Stopping threshold on the 6D pose error norm.
+    q_init : list | tuple | np.ndarray | None
+        Initial joint guess (length >= 6).
+
+    Returns
+    -------
+    list
+        Estimated 6 joint values in radians.
+
+    Homework Hints
+    --------------
+    Input:
+    - Target pose ``new_pose`` and a valid initial guess ``q_init``.
+    Output:
+    - Joint angles that minimize pose error.
+
+    Suggested implementation logic:
+    1. Evaluate current pose and Jacobian via ``your_fk``.
+    2. Build 6D error ``[position_error, orientation_error]``.
+    3. Compute ``delta_q = pinv(J) @ error``.
+    4. Apply step size and clip by joint limits.
+    5. Stop when error norm is below threshold.
+
+    Example
+    -------
+    ```python
+    target = [0.4, 0.0, 0.8, 0.0, 0.7071, 0.0, 0.7071]
+    q_sol = your_ik(target, base_pos=[-0.2, 0.13, 0.6], q_init=np.zeros(6))
+    ```
+
+    Notes
+    -----
+    Orientation error is computed from relative rotation
+    ``R_target @ R_current.T`` converted to axis-angle form.
     """
 
-    # Clipping limits: kept wide to not over-constrain the solver
+
+
     joint_limits = np.asarray([
             [-3*np.pi/2, -np.pi/2], # joint1
             [-2.3562, -1],           # joint2
@@ -42,19 +118,21 @@ def your_ik(new_pose : list or tuple or np.ndarray,
             [-17, 17],              # joint6
         ])
 
-    # Sampling limits for random restart: realistic UR5 physical range
-    # avoids extreme q values that produce singular rotation matrices in FK
-    restart_limits = np.asarray([
-            [-3*np.pi/2, -np.pi/2],   # joint1: same as above
-            [-2.3562,    -1.0],        # joint2: same as above
-            [-np.pi,      np.pi],      # joint3: ±π  (physically reasonable)
-            [-np.pi,      np.pi],      # joint4: ±π
-            [-np.pi,      np.pi],      # joint5: ±π
-            [-np.pi,      np.pi],      # joint6: ±π
-        ])
-
     tmp_q = _get_initial_q(q_init=q_init)
     base_pos = np.asarray(base_pos if base_pos is not None else [0.0, 0.0, 0.0], dtype=np.float64)
+        
+    # -------------------------------------------------------------------------------- #
+    # --- TODO: Read the task description                                          --- #
+    # --- Task 2 : Compute Inverse-Kinematic Solver of the robot by yourself.      --- #
+    # ---          Try to implement `your_ik` without simulator IK APIs           --- #
+    # ---          API. (40% for accuracy)                                         --- #
+    # --- Note : please modify the code in `your_ik` function.                     --- #
+    # -------------------------------------------------------------------------------- #
+    
+    #### your code ####
+
+    # TODO: update tmp_q using an iterative optimization loop.
+    # tmp_q = ? # may be more than one line
 
     dh_params = get_ur5_DH_params()
     target_pose = np.asarray(new_pose, dtype=np.float64).reshape(-1)
@@ -67,150 +145,86 @@ def your_ik(new_pose : list or tuple or np.ndarray,
     def pose_error(q):
         pose, jacobian = your_fk(dh_params, q, base_pos)
         pose = np.asarray(pose, dtype=np.float64)
+
         pos_error = target_pos - pose[:3]
         current_rot = R.from_quat(pose[3:]).as_matrix()
         rot_error = R.from_matrix(target_rot @ current_rot.T).as_rotvec()
         error = np.concatenate([pos_error, rot_error])
         return error, jacobian
 
-    # ------------------------------------------------------------------ #
-    # Hyper-parameters (tuned for max score)
-    # ------------------------------------------------------------------ #
-    # Step rates: fine-grained so line search can always find improvement
-    step_rates    = (1.0, 0.7, 0.5, 0.3, 0.2, 0.1, 0.05, 0.02, 0.01)
-    max_delta_norm = 0.15      # smaller = safer around singularities
-    dls_lambda     = 0.01      # Damped Least Squares damping factor
-    stall_tol      = 1e-7      # how little improvement counts as "stalled"
-    n_restarts     = 6         # number of random restarts if stalled
-    iters_per_run  = max_iters # iterations per restart attempt
+    step_rates = (1.0, 0.5, 0.25, 0.1, 0.05)
+    max_delta_norm = 0.25
 
-    def run_single(q_start, n_iters):
-        """One IK optimization run from q_start."""
-        q = np.clip(q_start.copy(), joint_limits[:, 0], joint_limits[:, 1])
-        best_q    = q.copy()
-        best_norm = np.inf
+    for _ in range(max_iters):
+        error, jacobian = pose_error(tmp_q)
+        error_norm = np.linalg.norm(error)
+        if error_norm < stop_thresh:
+            break
 
-        for _ in range(n_iters):
-            error, jacobian = pose_error(q)
-            error_norm = np.linalg.norm(error)
+        delta_q = pinv(jacobian) @ error
+        delta_norm = np.linalg.norm(delta_q)
+        if not np.isfinite(delta_norm):
+            break
+        if delta_norm > max_delta_norm:
+            delta_q = delta_q / delta_norm * max_delta_norm
 
-            if error_norm < best_norm:
-                best_norm = error_norm
-                best_q    = q.copy()
+        best_q = tmp_q
+        best_error_norm = error_norm
 
-            if error_norm < stop_thresh:
-                break
+        for step_rate in step_rates:
+            candidate_q = tmp_q + step_rate * delta_q
+            candidate_q = np.clip(candidate_q, joint_limits[:, 0], joint_limits[:, 1])
+            candidate_error, _ = pose_error(candidate_q)
+            candidate_error_norm = np.linalg.norm(candidate_error)
 
-            # ---- Damped Least Squares (DLS) instead of raw pinv ----
-            # delta_q = J^T (J J^T + λ²I)^{-1} e
-            # More numerically stable near singularities than pinv alone
-            JJT = jacobian @ jacobian.T
-            dls_inv = np.linalg.solve(
-                JJT + dls_lambda**2 * np.eye(6),
-                error
-            )
-            delta_q = jacobian.T @ dls_inv
+            if candidate_error_norm < best_error_norm:
+                best_q = candidate_q
+                best_error_norm = candidate_error_norm
 
-            # Fallback: if DLS gives nan/inf, use plain pinv
-            if not np.all(np.isfinite(delta_q)):
-                delta_q = pinv(jacobian) @ error
-            if not np.all(np.isfinite(delta_q)):
-                break
+        if best_error_norm >= error_norm - 1e-12:
+            break
 
-            # Clip step size
-            delta_norm = np.linalg.norm(delta_q)
-            if delta_norm > max_delta_norm:
-                delta_q = delta_q / delta_norm * max_delta_norm
+        tmp_q = best_q
+    
+    # hint : 
+    # 1. You may use `your_fk` function and jacobian matrix to do this
+    # 2. Be careful when computing the delta x
+    # 3. You may use some hyper parameters (i.e., step rate) in optimization loops
 
-            # Line search: pick the step that reduces error the most
-            candidate_best_q    = q
-            candidate_best_norm = error_norm
+    ###################
+    
 
-            for step_rate in step_rates:
-                cand_q = np.clip(
-                    q + step_rate * delta_q,
-                    joint_limits[:, 0], joint_limits[:, 1]
-                )
-                cand_error, _ = pose_error(cand_q)
-                cand_norm = np.linalg.norm(cand_error)
-                if cand_norm < candidate_best_norm:
-                    candidate_best_norm = cand_norm
-                    candidate_best_q    = cand_q
-
-            # Accept if any improvement (even tiny)
-            if candidate_best_norm < error_norm - stall_tol:
-                q = candidate_best_q
-                if candidate_best_norm < best_norm:
-                    best_norm = candidate_best_norm
-                    best_q    = q.copy()
-            else:
-                # Stalled — exit this run, let restart handle it
-                break
-
-        return best_q, best_norm
-
-    # ------------------------------------------------------------------ #
-    # First attempt: start from q_init (warm start — exploits continuity
-    # between consecutive IK calls, great for easy/medium cases)
-    # ------------------------------------------------------------------ #
-    best_q, best_norm = run_single(tmp_q, iters_per_run)
-
-    if best_norm >= stop_thresh:
-        # ------------------------------------------------------------------ #
-        # Random restart loop
-        # Strategy:
-        #   1. Always include q_init as one of the seeds (already done above)
-        #   2. Sample remaining seeds uniformly in joint limits
-        #   3. Keep the global best across all runs
-        # ------------------------------------------------------------------ #
-        rng = np.random.default_rng(seed=42)  # deterministic for reproducibility
-
-        for restart_idx in range(n_restarts):
-            if restart_idx < 2:
-                # First 2 restarts: perturb q_init slightly (stay near warm start)
-                noise_scale = 0.3 * (restart_idx + 1)
-                q_start = tmp_q + rng.uniform(-noise_scale, noise_scale, size=6)
-                q_start = np.clip(q_start, joint_limits[:, 0], joint_limits[:, 1])
-            else:
-                # Remaining restarts: sample from PHYSICAL range (±π for joints 3-6)
-                # NOT ±17 — extreme angles produce singular rotation matrices in FK
-                q_start = rng.uniform(restart_limits[:, 0], restart_limits[:, 1])
-                # still clip to joint_limits (which are wider, so this is a no-op
-                # for joint3-6 but safety-clips joint1/2 if needed)
-                q_start = np.clip(q_start, joint_limits[:, 0], joint_limits[:, 1])
-            q_candidate, norm_candidate = run_single(q_start, iters_per_run)
-
-            if norm_candidate < best_norm:
-                best_norm = norm_candidate
-                best_q    = q_candidate
-
-            # Early exit if good enough
-            if best_norm < stop_thresh:
-                break
-
-    return list(best_q)  # 6 DoF
+    return list(tmp_q) # 6 DoF
 
 
 def score_ik(student_ik_function, headless=False):
+    """Run official IK scoring for a student IK function.
+
+    Parameters
+    ----------
+    student_ik_function : Callable
+        Student IK function compatible with
+        ``student_ik_function(new_pose, base_pos, q_init=...)``.
+    headless : bool, default=False
+        Whether Isaac Sim runs without GUI.
+
+    Returns
+    -------
+    dict
+        Score summary including per-file scores and total score.
+
+    Notes
+    -----
+    The simulator setup and articulation control flow are preserved from the
+    original main-loop implementation.
+    """
     try:
         from isaacsim import SimulationApp
     except ImportError as exc:
         raise ImportError("Isaac Sim python modules are not available in current environment.") from exc
 
-    #sim_app = SimulationApp({"headless": bool(headless), "width": 1280, "height": 720})
-    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-    os.environ.setdefault("NVIDIA_VISIBLE_DEVICES", "0")
-    os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "Y")
-    os.environ.setdefault("PRIVACY_CONSENT", "Y")
+    sim_app = SimulationApp({"headless": bool(headless), "width": 1280, "height": 720})
 
-    sim_app = SimulationApp({
-        "headless": bool(headless),
-        "width": 1280,
-        "height": 720,
-        "active_gpu": 0,
-        "physics_gpu": 0,
-        "multi_gpu": False,
-    })
     try:
 
         from isaacsim.core.utils.stage import add_reference_to_stage
@@ -222,6 +236,8 @@ def score_ik(student_ik_function, headless=False):
         world = World(stage_units_in_meters=1.0)
         world.scene.add_default_ground_plane()
 
+
+        # Load UR5 into Isaac world using the requested API set.
         assets_root = get_assets_root_path()
         if assets_root is None:
             raise RuntimeError("Isaac assets root path is None")
@@ -233,9 +249,12 @@ def score_ik(student_ik_function, headless=False):
         robot_view = Articulation(prim_paths_expr=prim_path, name="ur5_view")
         articulation_controller = ArticulationController()
 
+        # Reset after stage edits, then initialize articulation controller.
         world.reset()
         articulation_controller.initialize(robot_view)
 
+
+        # Match Isaac initial pose to the reference initial joint states.
         reference_init_states = np.asarray([
             -3.141592642791131,
             -1.5707963240621052,
@@ -250,6 +269,7 @@ def score_ik(student_ik_function, headless=False):
         n_apply = min(target_positions.size, reference_init_states.size)
         target_positions[:n_apply] = reference_init_states[:n_apply]
 
+        # Drive articulation to target initial joint state.
         articulation_controller.apply_action(ArticulationAction(joint_positions=target_positions))
         for _ in range(40):
             world.step(render=not headless)
@@ -265,6 +285,7 @@ def score_ik(student_ik_function, headless=False):
         ]
 
         dh_params = get_ur5_DH_params()
+        # Keep base frame consistent with the verified Isaac FK test configuration.
         base_pos = np.asarray([-0.2, 0.13, 0.6], dtype=np.float64)
         current_positions = np.asarray(robot_view.get_joint_positions(), dtype=np.float64).reshape(-1)
         if current_positions.size < 6:
@@ -299,12 +320,14 @@ def score_ik(student_ik_function, headless=False):
                     )
                     q_curr = np.asarray(q_sol, dtype=np.float64)
 
+                    # Apply IK solution to UR5 articulation in Isaac Sim.
                     current_positions = np.asarray(robot_view.get_joint_positions(), dtype=np.float64).reshape(-1)
                     target_positions = current_positions.copy()
                     target_positions[:6] = q_curr
                     action = ArticulationAction(joint_positions=target_positions)
                     articulation_controller.apply_action(action)
 
+                    # Let articulation move before evaluating end-effector pose.
                     for _ in range(int(1 / SIM_TIMESTEP * 0.1)):
                         world.step(render=not headless)
 
@@ -318,6 +341,7 @@ def score_ik(student_ik_function, headless=False):
                     traceback.print_exc()
                     world.step(render=not headless)
                     continue
+
 
             ik_score[file_id] = 0.0 if ik_score[file_id] < 0.0 else ik_score[file_id]
             ik_errors = np.asarray(ik_errors)
@@ -347,11 +371,25 @@ def score_ik(student_ik_function, headless=False):
         traceback.print_exc()
         raise
     finally:
+
         sim_app.close()
 
 
 def main(args):
+    """CLI entry point for IK homework evaluation.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Command-line options. ``headless`` is forwarded to the scorer.
+
+    Returns
+    -------
+    dict
+        Score summary from ``score_ik``.
+    """
     return score_ik(your_ik, headless=bool(args.headless))
+    
 
 
 if __name__=="__main__":
